@@ -12,7 +12,7 @@ GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.strip() else 0
 DATA_FILE = "item_distribution_data.json"
 
 DEFAULT_DATA = {
-    "priority_role_id": None,
+    "priority_order": [],
     "panel_channel_id": None,
     "panel_message_id": None,
     "categories": {
@@ -45,8 +45,8 @@ DEFAULT_DATA = {
 }
 
 NOTICE_TEXT = (
-    "Priority players have reserved access. If a priority player selects an item "
-    "that’s already full, the most recent non-priority selection will be removed. "
+    "Priority players have reserved access. If a higher-priority player selects an item "
+    "that’s already full, the lowest-priority current selection will be removed. "
     "Affected players may choose another item."
 )
 
@@ -79,11 +79,32 @@ def now_ts():
     return datetime.now(timezone.utc).timestamp()
 
 
-def is_priority(member: discord.Member) -> bool:
-    priority_role_id = data_store.get("priority_role_id")
-    if not priority_role_id:
-        return False
-    return any(role.id == priority_role_id for role in member.roles)
+def get_priority_order():
+    return data_store.setdefault("priority_order", [])
+
+
+def get_priority_rank(user_id: int) -> int:
+    """
+    Lower number = higher priority.
+    Ranked users: 1,2,3...
+    Unranked users get a very low priority value.
+    """
+    priority_order = get_priority_order()
+    try:
+        return priority_order.index(user_id) + 1
+    except ValueError:
+        return 999999
+
+
+def is_ranked(user_id: int) -> bool:
+    return user_id in get_priority_order()
+
+
+def format_rank_badge(user_id: int) -> str:
+    rank = get_priority_rank(user_id)
+    if rank == 999999:
+        return ""
+    return f"`#{rank}` "
 
 
 def find_user_selection_in_category(category_key: str, user_id: int):
@@ -116,26 +137,41 @@ def format_user_mention(user_id: int) -> str:
     return f"<@{user_id}>"
 
 
+def build_priority_block() -> str:
+    priority_order = get_priority_order()
+    lines = ["## Priority Order", DIVIDER]
+
+    if not priority_order:
+        lines.append("No priority players set.")
+        return "\n".join(lines)
+
+    for idx, user_id in enumerate(priority_order, start=1):
+        lines.append(f"{idx}. {format_user_mention(user_id)}")
+
+    return "\n".join(lines)
+
+
 def build_category_block(category_key: str) -> str:
     category_data = data_store["categories"][category_key]
     label = category_data["label"]
     items = category_data["items"]
 
-    lines = [
-        f"## {label}",
-        DIVIDER
-    ]
+    lines = [f"## {label}", DIVIDER]
 
     for item_name, item_data in items.items():
         capacity = item_data["capacity"]
-        selections = sorted(item_data["selections"], key=lambda x: x["selected_at"])
+        selections = sorted(
+            item_data["selections"],
+            key=lambda x: (get_priority_rank(x["user_id"]), x["selected_at"])
+        )
 
         lines.append(f"**{item_name}** — `{len(selections)}/{capacity}`")
 
         if selections:
             for idx, entry in enumerate(selections, start=1):
-                badge = "⭐ " if entry.get("priority", False) else ""
-                lines.append(f"↳ {idx}. {badge}{format_user_mention(entry['user_id'])}")
+                user_id = entry["user_id"]
+                rank_badge = format_rank_badge(user_id)
+                lines.append(f"↳ {idx}. {rank_badge}{format_user_mention(user_id)}")
         else:
             lines.append("↳ *No reservation yet*")
 
@@ -150,17 +186,15 @@ def build_panel_embed(guild: discord.Guild) -> discord.Embed:
         description=(
             f"**Notice**\n"
             f"{NOTICE_TEXT}\n\n"
-            f"{DIVIDER}\n"
+            f"{build_priority_block()}\n\n"
+            f"{DIVIDER}\n\n"
             f"{build_category_block('main_items')}\n"
             f"{DIVIDER}\n\n"
             f"{build_category_block('other_items')}"
         ),
         color=discord.Color.blurple()
     )
-
-    priority_role_id = data_store.get("priority_role_id")
-    priority_line = f"<@&{priority_role_id}>" if priority_role_id else "Not set"
-    embed.set_footer(text=f"Priority role: {priority_line}")
+    embed.set_footer(text="Lower rank number = higher priority")
     return embed
 
 
@@ -209,7 +243,7 @@ class ItemSelect(discord.ui.Select):
             return
 
         member = interaction.user
-        member_is_priority = is_priority(member)
+        member_rank = get_priority_rank(member.id)
 
         previous_item = find_user_selection_in_category(category_key, member.id)
         if previous_item == selected_item_name:
@@ -224,43 +258,29 @@ class ItemSelect(discord.ui.Select):
 
         selections = selected_item["selections"]
         capacity = selected_item["capacity"]
-        kicked_user_id = None
+        removed_user_id = None
 
         if len(selections) >= capacity:
-            if member_is_priority:
-                non_priority_entries = [e for e in selections if not e.get("priority", False)]
-                if non_priority_entries:
-                    latest_non_priority = max(non_priority_entries, key=lambda x: x["selected_at"])
-                    kicked_user_id = latest_non_priority["user_id"]
-                    selections.remove(latest_non_priority)
-                else:
-                    if previous_item:
-                        old_item = get_item_data(category_key, previous_item)
-                        if old_item and len(old_item["selections"]) < old_item["capacity"]:
-                            old_item["selections"].append({
-                                "user_id": member.id,
-                                "selected_at": now_ts(),
-                                "priority": member_is_priority
-                            })
+            lowest_priority_entry = max(
+                selections,
+                key=lambda x: (get_priority_rank(x["user_id"]), x["selected_at"])
+            )
+            lowest_priority_rank = get_priority_rank(lowest_priority_entry["user_id"])
 
-                    await interaction.response.send_message(
-                        "That item is full and all current reservations are priority players.",
-                        ephemeral=True
-                    )
-                    save_data(data_store)
-                    return
+            if member_rank < lowest_priority_rank:
+                removed_user_id = lowest_priority_entry["user_id"]
+                selections.remove(lowest_priority_entry)
             else:
                 if previous_item:
                     old_item = get_item_data(category_key, previous_item)
                     if old_item and len(old_item["selections"]) < old_item["capacity"]:
                         old_item["selections"].append({
                             "user_id": member.id,
-                            "selected_at": now_ts(),
-                            "priority": member_is_priority
+                            "selected_at": now_ts()
                         })
 
                 await interaction.response.send_message(
-                    f"**{selected_item_name}** is already full.",
+                    f"**{selected_item_name}** is already full, and everyone currently holding it has equal or higher priority than you.",
                     ephemeral=True
                 )
                 save_data(data_store)
@@ -268,8 +288,7 @@ class ItemSelect(discord.ui.Select):
 
         selected_item["selections"].append({
             "user_id": member.id,
-            "selected_at": now_ts(),
-            "priority": member_is_priority
+            "selected_at": now_ts()
         })
 
         save_data(data_store)
@@ -278,8 +297,8 @@ class ItemSelect(discord.ui.Select):
         msg = f"✅ You selected **{selected_item_name}**."
         if previous_item:
             msg += f"\nYour previous choice **{previous_item}** was removed."
-        if kicked_user_id:
-            msg += f"\nPriority override applied. Removed most recent non-priority user: <@{kicked_user_id}>."
+        if removed_user_id:
+            msg += f"\nPriority override applied. Removed: <@{removed_user_id}>."
 
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -399,21 +418,6 @@ async def create_item_panel(interaction: discord.Interaction):
     data_store["panel_channel_id"] = interaction.channel.id
     data_store["panel_message_id"] = message.id
     save_data(data_store)
-
-
-@bot.tree.command(name="set_priority_role", description="Set the role considered as priority.")
-@admin_only()
-async def set_priority_role(interaction: discord.Interaction, role: discord.Role):
-    data_store["priority_role_id"] = role.id
-    save_data(data_store)
-
-    if interaction.guild:
-        await refresh_panel(interaction.guild)
-
-    await interaction.response.send_message(
-        f"Priority role set to {role.mention}.",
-        ephemeral=True
-    )
 
 
 @bot.tree.command(name="set_item_cap", description="Set reservation cap for an item.")
@@ -629,6 +633,136 @@ async def refresh_item_panel(interaction: discord.Interaction):
 
     await refresh_panel(interaction.guild)
     await interaction.response.send_message("Panel refreshed.", ephemeral=True)
+
+
+@bot.tree.command(name="add_priority_player", description="Add a player to the priority list.")
+@admin_only()
+@app_commands.describe(user="User to add", position="Optional position number, default adds to the end")
+async def add_priority_player(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    position: app_commands.Range[int, 1, 100] | None = None
+):
+    priority_order = get_priority_order()
+
+    if user.id in priority_order:
+        await interaction.response.send_message(
+            f"{user.mention} is already in the priority list.",
+            ephemeral=True
+        )
+        return
+
+    if position is None or position > len(priority_order) + 1:
+        priority_order.append(user.id)
+        new_position = len(priority_order)
+    else:
+        priority_order.insert(position - 1, user.id)
+        new_position = position
+
+    save_data(data_store)
+
+    if interaction.guild:
+        await refresh_panel(interaction.guild)
+
+    await interaction.response.send_message(
+        f"Added {user.mention} to priority position **{new_position}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="remove_priority_player", description="Remove a player from the priority list.")
+@admin_only()
+async def remove_priority_player(interaction: discord.Interaction, user: discord.Member):
+    priority_order = get_priority_order()
+
+    if user.id not in priority_order:
+        await interaction.response.send_message(
+            f"{user.mention} is not in the priority list.",
+            ephemeral=True
+        )
+        return
+
+    old_position = priority_order.index(user.id) + 1
+    priority_order.remove(user.id)
+    save_data(data_store)
+
+    if interaction.guild:
+        await refresh_panel(interaction.guild)
+
+    await interaction.response.send_message(
+        f"Removed {user.mention} from priority position **{old_position}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="move_priority_player", description="Move a player to a different priority position.")
+@admin_only()
+@app_commands.describe(user="User to move", position="New priority position")
+async def move_priority_player(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    position: app_commands.Range[int, 1, 100]
+):
+    priority_order = get_priority_order()
+
+    if user.id not in priority_order:
+        await interaction.response.send_message(
+            f"{user.mention} is not in the priority list.",
+            ephemeral=True
+        )
+        return
+
+    priority_order.remove(user.id)
+
+    if position > len(priority_order) + 1:
+        position = len(priority_order) + 1
+
+    priority_order.insert(position - 1, user.id)
+    save_data(data_store)
+
+    if interaction.guild:
+        await refresh_panel(interaction.guild)
+
+    await interaction.response.send_message(
+        f"Moved {user.mention} to priority position **{position}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="clear_priority_list", description="Clear the full priority list.")
+@admin_only()
+async def clear_priority_list(interaction: discord.Interaction):
+    data_store["priority_order"] = []
+    save_data(data_store)
+
+    if interaction.guild:
+        await refresh_panel(interaction.guild)
+
+    await interaction.response.send_message(
+        "Cleared the priority list.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="show_priority_list", description="Show the current priority list.")
+async def show_priority_list(interaction: discord.Interaction):
+    priority_order = get_priority_order()
+
+    if not priority_order:
+        await interaction.response.send_message(
+            "No priority players set.",
+            ephemeral=True
+        )
+        return
+
+    lines = []
+    for idx, user_id in enumerate(priority_order, start=1):
+        lines.append(f"{idx}. <@{user_id}>")
+
+    await interaction.response.send_message(
+        "**Priority Order**\n" + "\n".join(lines),
+        ephemeral=True
+    )
 
 
 if TOKEN:
