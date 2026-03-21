@@ -6,7 +6,8 @@ import os
 from datetime import datetime, timezone
 
 TOKEN = os.getenv("TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID_RAW = os.getenv("GUILD_ID")
+GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.strip() else 0
 
 DATA_FILE = "item_distribution_data.json"
 
@@ -48,6 +49,8 @@ NOTICE_TEXT = (
     "that’s already full, the most recent non-priority selection will be removed. "
     "Affected players may choose another item."
 )
+
+DIVIDER = "────────────────────"
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -113,36 +116,47 @@ def format_user_mention(user_id: int) -> str:
     return f"<@{user_id}>"
 
 
+def build_category_block(category_key: str) -> str:
+    category_data = data_store["categories"][category_key]
+    label = category_data["label"]
+    items = category_data["items"]
+
+    lines = [
+        f"## {label}",
+        DIVIDER
+    ]
+
+    for item_name, item_data in items.items():
+        capacity = item_data["capacity"]
+        selections = sorted(item_data["selections"], key=lambda x: x["selected_at"])
+
+        lines.append(f"**{item_name}** — `{len(selections)}/{capacity}`")
+
+        if selections:
+            for idx, entry in enumerate(selections, start=1):
+                badge = "⭐ " if entry.get("priority", False) else ""
+                lines.append(f"↳ {idx}. {badge}{format_user_mention(entry['user_id'])}")
+        else:
+            lines.append("↳ *No reservation yet*")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
-        title="Item Reservation Panel",
-        description=NOTICE_TEXT,
+        title="🎁 Item Reservation Panel",
+        description=(
+            f"**Notice**\n"
+            f"{NOTICE_TEXT}\n\n"
+            f"{DIVIDER}\n"
+            f"{build_category_block('main_items')}\n"
+            f"{DIVIDER}\n\n"
+            f"{build_category_block('other_items')}"
+        ),
         color=discord.Color.blurple()
     )
-
-    for category_key, category_data in data_store["categories"].items():
-        label = category_data["label"]
-        lines = []
-
-        for item_name, item_data in category_data["items"].items():
-            capacity = item_data["capacity"]
-            selections = item_data["selections"]
-
-            lines.append(f"**{item_name}** ({len(selections)}/{capacity})")
-            if selections:
-                sorted_entries = sorted(selections, key=lambda x: x["selected_at"])
-                for i, entry in enumerate(sorted_entries, start=1):
-                    badge = "⭐ " if entry.get("priority", False) else ""
-                    lines.append(f"{i}. {badge}{format_user_mention(entry['user_id'])}")
-            else:
-                lines.append("- None")
-            lines.append("")
-
-        embed.add_field(
-            name=label,
-            value="\n".join(lines)[:1024] if lines else "No items.",
-            inline=False
-        )
 
     priority_role_id = data_store.get("priority_role_id")
     priority_line = f"<@&{priority_role_id}>" if priority_role_id else "Not set"
@@ -261,20 +275,53 @@ class ItemSelect(discord.ui.Select):
         save_data(data_store)
         await refresh_panel(interaction.guild)
 
-        msg = f"You selected **{selected_item_name}**."
+        msg = f"✅ You selected **{selected_item_name}**."
         if previous_item:
-            msg += f" Your previous choice **{previous_item}** was removed."
+            msg += f"\nYour previous choice **{previous_item}** was removed."
         if kicked_user_id:
-            msg += f" Priority override applied. Removed most recent non-priority user: <@{kicked_user_id}>."
+            msg += f"\nPriority override applied. Removed most recent non-priority user: <@{kicked_user_id}>."
 
         await interaction.response.send_message(msg, ephemeral=True)
+
+
+class RemoveSelectionButton(discord.ui.Button):
+    def __init__(self, category_key: str, label: str):
+        self.category_key = category_key
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label=label,
+            custom_id=f"remove_{category_key}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        removed = remove_user_from_category(self.category_key, interaction.user.id)
+        if not removed:
+            await interaction.response.send_message(
+                "You do not have a selection in this category.",
+                ephemeral=True
+            )
+            return
+
+        save_data(data_store)
+        await refresh_panel(interaction.guild)
+
+        await interaction.response.send_message(
+            f"🗑️ Removed your selection from **{removed}**.",
+            ephemeral=True
+        )
 
 
 class ItemPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(ItemSelect("main_items"))
+        self.add_item(RemoveSelectionButton("main_items", "Remove Main Item"))
         self.add_item(ItemSelect("other_items"))
+        self.add_item(RemoveSelectionButton("other_items", "Remove Other Item"))
 
 
 async def get_panel_message(guild: discord.Guild) -> discord.Message | None:
