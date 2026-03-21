@@ -1,21 +1,22 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 import asyncpg
-import asyncio
-import json
 import os
+import json
 from datetime import datetime, timezone
 
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+MAX_ITEMS_PER_PLAYER = 2  # 🔥 LIMIT PER PLAYER
 
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool = None
-data_store = {"events": {}, "global_priority_order": {}}
+data_store = {"events": {}}
 
 # =========================
 # DATABASE
@@ -58,24 +59,26 @@ async def save_data():
 def now():
     return datetime.now(timezone.utc).timestamp()
 
-def get_event(name):
-    return data_store["events"].get(name.lower())
-
 def ensure_event(name):
     key = name.lower()
     if key not in data_store["events"]:
         data_store["events"][key] = {
             "name": name,
-            "priority_mode": "event",
             "priority_order": [],
+            "is_locked": False,
             "categories": {
                 "main": {"label": "Main Items", "items": {}},
                 "other": {"label": "Other Items", "items": {}}
-            },
-            "lock_time": None,
-            "is_locked": False
+            }
         }
     return data_store["events"][key]
+
+def count_user_items(event, user_id):
+    total = 0
+    for cat in event["categories"].values():
+        for item in cat["items"].values():
+            total += sum(1 for x in item["selections"] if x["user_id"] == user_id)
+    return total
 
 def rank(event, user):
     try:
@@ -90,35 +93,37 @@ def auto_assign(event):
     players = event["priority_order"]
 
     for cat in event["categories"].values():
-        for item_name, item in cat["items"].items():
+        for item in cat["items"].values():
             while len(item["selections"]) < item["capacity"]:
                 for user in players:
                     if user not in [x["user_id"] for x in item["selections"]]:
-                        item["selections"].append({
-                            "user_id": user,
-                            "selected_at": now()
-                        })
-                        break
+                        if count_user_items(event, user) < MAX_ITEMS_PER_PLAYER:
+                            item["selections"].append({
+                                "user_id": user,
+                                "selected_at": now()
+                            })
+                            break
                 else:
                     break
 
 # =========================
-# EMBED
+# EMBED UI
 # =========================
 def build_embed(event):
-    desc = ""
+    embed = discord.Embed(
+        title=f"🎁 {event['name']} Distribution",
+        color=discord.Color.blurple()
+    )
 
     for cat in event["categories"].values():
-        desc += f"**{cat['label']}**\n"
+        text = ""
         for item, data in cat["items"].items():
             users = ", ".join([f"<@{x['user_id']}>" for x in data["selections"]])
-            desc += f"{item} ({len(data['selections'])}/{data['capacity']}): {users or 'None'}\n"
-        desc += "\n"
+            text += f"**{item}** ({len(data['selections'])}/{data['capacity']})\n{users or '—'}\n\n"
 
-    return discord.Embed(
-        title=f"🎁 {event['name']} Panel",
-        description=desc
-    )
+        embed.add_field(name=cat["label"], value=text or "No items", inline=False)
+
+    return embed
 
 # =========================
 # SELECT
@@ -145,14 +150,19 @@ class Select(discord.ui.Select):
             await interaction.response.send_message("Panel is locked", ephemeral=True)
             return
 
+        if count_user_items(event, interaction.user.id) >= MAX_ITEMS_PER_PLAYER:
+            await interaction.response.send_message(
+                f"You can only select {MAX_ITEMS_PER_PLAYER} items.",
+                ephemeral=True
+            )
+            return
+
         item = event["categories"][self.cat_key]["items"][self.values[0]]
 
-        # prevent duplicate
         if interaction.user.id in [x["user_id"] for x in item["selections"]]:
             await interaction.response.send_message("Already selected", ephemeral=True)
             return
 
-        # capacity + priority
         if len(item["selections"]) >= item["capacity"]:
             lowest = max(item["selections"], key=lambda x: rank(event, x["user_id"]))
             if rank(event, interaction.user.id) < rank(event, lowest["user_id"]):
@@ -185,16 +195,13 @@ class View(discord.ui.View):
 
 @bot.tree.command(name="create_event")
 async def create_event(interaction, name: str):
-    event = ensure_event(name)
+    ensure_event(name)
     await save_data()
     await interaction.response.send_message(f"Event **{name}** created")
 
 @bot.tree.command(name="create_panel")
 async def create_panel(interaction, name: str):
-    event = get_event(name)
-    if not event:
-        await interaction.response.send_message("Event not found", ephemeral=True)
-        return
+    event = ensure_event(name)
 
     msg = await interaction.channel.send(embed=build_embed(event), view=View(name.lower()))
     event["panel_channel_id"] = interaction.channel.id
@@ -205,10 +212,7 @@ async def create_panel(interaction, name: str):
 
 @bot.tree.command(name="add_item")
 async def add_item(interaction, name: str, category: str, item: str, cap: int):
-    event = get_event(name)
-    if not event:
-        await interaction.response.send_message("Event not found", ephemeral=True)
-        return
+    event = ensure_event(name)
 
     event["categories"][category]["items"][item] = {
         "capacity": cap,
@@ -220,29 +224,32 @@ async def add_item(interaction, name: str, category: str, item: str, cap: int):
 
 @bot.tree.command(name="add_priority")
 async def add_priority(interaction, name: str, user: discord.Member):
-    event = get_event(name)
+    event = ensure_event(name)
     event["priority_order"].append(user.id)
 
     await save_data()
-    await interaction.response.send_message("Added priority", ephemeral=True)
+    await interaction.response.send_message("Priority added", ephemeral=True)
 
 @bot.tree.command(name="lock_event")
 async def lock_event(interaction, name: str):
-    event = get_event(name)
+    event = ensure_event(name)
 
     auto_assign(event)
     event["is_locked"] = True
 
-    winners = "🏆 **Winners**\n"
+    msg = "🏆 **Winners**\n\n"
     for cat in event["categories"].values():
         for item, data in cat["items"].items():
             if data["selections"]:
                 users = ", ".join([f"<@{x['user_id']}>" for x in data["selections"]])
-                winners += f"{item}: {users}\n"
+                msg += f"**{item}**: {users}\n"
 
-    await interaction.channel.send(winners)
+    await interaction.channel.send(msg)
     await save_data()
 
+# =========================
+# READY
+# =========================
 @bot.event
 async def on_ready():
     await init_db()
