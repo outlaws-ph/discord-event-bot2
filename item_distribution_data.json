@@ -1,0 +1,32 @@
+{
+  "priority_role_id": null,
+  "panel_channel_id": null,
+  "panel_message_id": null,
+  "categories": {
+    "main_items": {
+      "label": "Main Items",
+      "items": {
+        "Rune Bracelet": {"capacity": 1, "selections": []},
+        "Rune Gloves": {"capacity": 1, "selections": []},
+        "Steel Spear": {"capacity": 1, "selections": []},
+        "Steel Helmet": {"capacity": 1, "selections": []},
+        "Grim Helmet": {"capacity": 1, "selections": []},
+        "Grim Lyra": {"capacity": 1, "selections": []},
+        "Grim Spear": {"capacity": 1, "selections": []},
+        "Grim Gloves": {"capacity": 1, "selections": []},
+        "Grim Necklace": {"capacity": 1, "selections": []},
+        "Storm Chain": {"capacity": 1, "selections": []}
+      }
+    },
+    "other_items": {
+      "label": "Other Items",
+      "items": {
+        "Old Silver Coin": {"capacity": 1, "selections": []},
+        "Gold Key": {"capacity": 1, "selections": []},
+        "Soul (UC)": {"capacity": 1, "selections": []},
+        "Soul (Rare)": {"capacity": 1, "selections": []},
+        "Soul (Epic)": {"capacity": 1, "selections": []}
+      }
+    }
+  }
+}
