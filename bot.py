@@ -1,108 +1,253 @@
-# ONLY SHOWING THE MODIFIED CORE PART (selection logic change)
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+import asyncpg
+import asyncio
+import json
+import os
+from datetime import datetime, timezone
 
-# FIND THIS FUNCTION IN YOUR CODE:
-def find_user_selection_in_category(event_data: dict, category_key: str, user_id: int):
-    # ❌ REMOVE THIS FUNCTION COMPLETELY
-    return None
+TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
+intents = discord.Intents.default()
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# -----------------------------
-# UPDATE SELECT CALLBACK
-# -----------------------------
+db_pool = None
+data_store = {"events": {}, "global_priority_order": {}}
 
-class ItemSelect(discord.ui.Select):
-    def __init__(self, event_key: str, category_key: str):
-        self.event_key = event_key
-        self.category_key = category_key
-        event_data = data_store["events"][event_key]
-        category_data = event_data["categories"][category_key]
+# =========================
+# DATABASE
+# =========================
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
 
-        options = []
-        for item_name, item_data in category_data["items"].items():
-            options.append(
-                discord.SelectOption(
-                    label=item_name[:100],
-                    description=f"{len(item_data['selections'])}/{item_data['capacity']} reserved",
-                    value=item_name
-                )
-            )
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS data (
+            id INT PRIMARY KEY,
+            json TEXT
+        )
+        """)
 
-        super().__init__(
-            placeholder=f"{event_data['name']} • {category_data['label']}",
-            min_values=1,
-            max_values=1,
-            options=options[:25],
-            custom_id=f"select:{event_key}:{category_key}"
+        await conn.execute("""
+        INSERT INTO data (id, json)
+        VALUES (1, '{}')
+        ON CONFLICT (id) DO NOTHING
+        """)
+
+async def load_data():
+    global data_store
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT json FROM data WHERE id=1")
+        if row and row["json"]:
+            data_store = json.loads(row["json"])
+
+async def save_data():
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE data SET json=$1 WHERE id=1",
+            json.dumps(data_store)
         )
 
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Server only.", ephemeral=True)
+# =========================
+# HELPERS
+# =========================
+def now():
+    return datetime.now(timezone.utc).timestamp()
+
+def get_event(name):
+    return data_store["events"].get(name.lower())
+
+def ensure_event(name):
+    key = name.lower()
+    if key not in data_store["events"]:
+        data_store["events"][key] = {
+            "name": name,
+            "priority_mode": "event",
+            "priority_order": [],
+            "categories": {
+                "main": {"label": "Main Items", "items": {}},
+                "other": {"label": "Other Items", "items": {}}
+            },
+            "lock_time": None,
+            "is_locked": False
+        }
+    return data_store["events"][key]
+
+def rank(event, user):
+    try:
+        return event["priority_order"].index(user) + 1
+    except:
+        return 999999
+
+# =========================
+# AUTO ASSIGN LEFTOVERS
+# =========================
+def auto_assign(event):
+    players = event["priority_order"]
+
+    for cat in event["categories"].values():
+        for item_name, item in cat["items"].items():
+            while len(item["selections"]) < item["capacity"]:
+                for user in players:
+                    if user not in [x["user_id"] for x in item["selections"]]:
+                        item["selections"].append({
+                            "user_id": user,
+                            "selected_at": now()
+                        })
+                        break
+                else:
+                    break
+
+# =========================
+# EMBED
+# =========================
+def build_embed(event):
+    desc = ""
+
+    for cat in event["categories"].values():
+        desc += f"**{cat['label']}**\n"
+        for item, data in cat["items"].items():
+            users = ", ".join([f"<@{x['user_id']}>" for x in data["selections"]])
+            desc += f"{item} ({len(data['selections'])}/{data['capacity']}): {users or 'None'}\n"
+        desc += "\n"
+
+    return discord.Embed(
+        title=f"🎁 {event['name']} Panel",
+        description=desc
+    )
+
+# =========================
+# SELECT
+# =========================
+class Select(discord.ui.Select):
+    def __init__(self, event_key, cat_key):
+        self.event_key = event_key
+        self.cat_key = cat_key
+
+        event = data_store["events"][event_key]
+        items = event["categories"][cat_key]["items"]
+
+        options = [
+            discord.SelectOption(label=i, value=i)
+            for i in items.keys()
+        ]
+
+        super().__init__(options=options[:25])
+
+    async def callback(self, interaction):
+        event = data_store["events"][self.event_key]
+
+        if event["is_locked"]:
+            await interaction.response.send_message("Panel is locked", ephemeral=True)
             return
 
-        event_data = data_store["events"].get(self.event_key)
-        if not event_data:
-            await interaction.response.send_message("Event not found.", ephemeral=True)
+        item = event["categories"][self.cat_key]["items"][self.values[0]]
+
+        # prevent duplicate
+        if interaction.user.id in [x["user_id"] for x in item["selections"]]:
+            await interaction.response.send_message("Already selected", ephemeral=True)
             return
 
-        if is_event_locked(event_data):
-            await interaction.response.send_message("❌ Panel is locked.", ephemeral=True)
-            return
-
-        selected_item_name = self.values[0]
-        selected_item = get_item_data(event_data, self.category_key, selected_item_name)
-
-        if not selected_item:
-            await interaction.response.send_message("Item not found.", ephemeral=True)
-            return
-
-        user_id = interaction.user.id
-
-        # ✅ NEW: check if already selected THIS item
-        for entry in selected_item["selections"]:
-            if entry["user_id"] == user_id:
-                await interaction.response.send_message(
-                    f"You already selected **{selected_item_name}**.",
-                    ephemeral=True
-                )
-                return
-
-        selections = selected_item["selections"]
-        capacity = selected_item["capacity"]
-        removed_user_id = None
-        member_rank = get_priority_rank(event_data, user_id)
-
-        # ✅ HANDLE FULL ITEM
-        if len(selections) >= capacity:
-            lowest_entry = max(
-                selections,
-                key=lambda x: (get_priority_rank(event_data, x["user_id"]), x["selected_at"])
-            )
-
-            lowest_rank = get_priority_rank(event_data, lowest_entry["user_id"])
-
-            if member_rank < lowest_rank:
-                removed_user_id = lowest_entry["user_id"]
-                selections.remove(lowest_entry)
+        # capacity + priority
+        if len(item["selections"]) >= item["capacity"]:
+            lowest = max(item["selections"], key=lambda x: rank(event, x["user_id"]))
+            if rank(event, interaction.user.id) < rank(event, lowest["user_id"]):
+                item["selections"].remove(lowest)
             else:
-                await save_state()
-                await interaction.response.send_message(
-                    f"❌ **{selected_item_name}** is full and higher priority players own it.",
-                    ephemeral=True
-                )
+                await interaction.response.send_message("Item full", ephemeral=True)
                 return
 
-        # ✅ ADD USER (MULTI SELECT ENABLED)
-        selections.append({
-            "user_id": user_id,
-            "selected_at": now_ts()
+        item["selections"].append({
+            "user_id": interaction.user.id,
+            "selected_at": now()
         })
 
-        await save_state()
-        await refresh_event_panel(interaction.guild, self.event_key)
+        await save_data()
+        await interaction.message.edit(embed=build_embed(event))
+        await interaction.response.send_message("Selected!", ephemeral=True)
 
-        msg = f"✅ You selected **{selected_item_name}**."
-        if removed_user_id:
-            msg += f"\n⚠️ Removed <@{removed_user_id}> due to priority."
+# =========================
+# VIEW
+# =========================
+class View(discord.ui.View):
+    def __init__(self, event_key):
+        super().__init__(timeout=None)
+        self.add_item(Select(event_key, "main"))
+        self.add_item(Select(event_key, "other"))
 
-        await interaction.response.send_message(msg, ephemeral=True)
+# =========================
+# COMMANDS
+# =========================
+
+@bot.tree.command(name="create_event")
+async def create_event(interaction, name: str):
+    event = ensure_event(name)
+    await save_data()
+    await interaction.response.send_message(f"Event **{name}** created")
+
+@bot.tree.command(name="create_panel")
+async def create_panel(interaction, name: str):
+    event = get_event(name)
+    if not event:
+        await interaction.response.send_message("Event not found", ephemeral=True)
+        return
+
+    msg = await interaction.channel.send(embed=build_embed(event), view=View(name.lower()))
+    event["panel_channel_id"] = interaction.channel.id
+    event["panel_message_id"] = msg.id
+
+    await save_data()
+    await interaction.response.send_message("Panel created", ephemeral=True)
+
+@bot.tree.command(name="add_item")
+async def add_item(interaction, name: str, category: str, item: str, cap: int):
+    event = get_event(name)
+    if not event:
+        await interaction.response.send_message("Event not found", ephemeral=True)
+        return
+
+    event["categories"][category]["items"][item] = {
+        "capacity": cap,
+        "selections": []
+    }
+
+    await save_data()
+    await interaction.response.send_message("Item added", ephemeral=True)
+
+@bot.tree.command(name="add_priority")
+async def add_priority(interaction, name: str, user: discord.Member):
+    event = get_event(name)
+    event["priority_order"].append(user.id)
+
+    await save_data()
+    await interaction.response.send_message("Added priority", ephemeral=True)
+
+@bot.tree.command(name="lock_event")
+async def lock_event(interaction, name: str):
+    event = get_event(name)
+
+    auto_assign(event)
+    event["is_locked"] = True
+
+    winners = "🏆 **Winners**\n"
+    for cat in event["categories"].values():
+        for item, data in cat["items"].items():
+            if data["selections"]:
+                users = ", ".join([f"<@{x['user_id']}>" for x in data["selections"]])
+                winners += f"{item}: {users}\n"
+
+    await interaction.channel.send(winners)
+    await save_data()
+
+@bot.event
+async def on_ready():
+    await init_db()
+    await load_data()
+    await bot.tree.sync()
+    print("READY")
+
+bot.run(TOKEN)
