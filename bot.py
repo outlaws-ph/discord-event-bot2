@@ -315,20 +315,18 @@ def auto_assign_leftovers(event: dict):
 def build_category_text(event: dict, category_key: str) -> str:
     items = event["categories"][category_key]["items"]
     if not items:
-        return "None"
+        return "No items in this category."
 
     all_items = sorted(items.items(), key=lambda x: x[0].lower())
     lines = []
 
-    for item_name, item_data in all_items[:20]:
+    for item_name, item_data in all_items:
         count = len(item_data["selections"])
         cap = item_data["capacity"]
         lines.append(f"• **{item_name}** `{count}/{cap}`")
 
-    if len(all_items) > 20:
-        lines.append(f"...and {len(all_items) - 20} more")
-
-    return "\n".join(lines)[:1024]
+    text = "\n".join(lines)
+    return text[:4096]
 
 
 def build_priority_preview(event: dict) -> str:
@@ -351,9 +349,9 @@ def build_current_page_details(event: dict) -> str:
     page_count = get_page_count(event, category)
 
     if not page_items:
-        return f"**{CATEGORY_MAP[category]}** — Page **{page + 1}/{page_count}**\nNo items on this page."
+        return f"No items on this page.\nPage **{page + 1}/{page_count}**"
 
-    blocks = [f"**{CATEGORY_MAP[category]}** — Page **{page + 1}/{page_count}**", ""]
+    blocks = [f"Page **{page + 1}/{page_count}**", ""]
 
     for item_name, item_data in page_items:
         count = len(item_data["selections"])
@@ -361,9 +359,9 @@ def build_current_page_details(event: dict) -> str:
         users = [f"<@{x['user_id']}>" for x in item_data["selections"]]
 
         if users:
-            display_users = ", ".join(users[:6])
-            if len(users) > 6:
-                display_users += f" +{len(users) - 6} more"
+            display_users = ", ".join(users[:8])
+            if len(users) > 8:
+                display_users += f" +{len(users) - 8} more"
         else:
             display_users = "—"
 
@@ -377,34 +375,30 @@ def build_current_page_details(event: dict) -> str:
 def build_embed(event: dict) -> discord.Embed:
     clamp_page(event)
     active_category = event["ui_state"]["category"]
+    active_label = CATEGORY_MAP[active_category]
+    page_count = get_page_count(event, active_category)
+    current_page = event["ui_state"]["page"] + 1
 
     embed = discord.Embed(
         title=f"🎁 {event['name']}",
         description=(
-            "Select items below.\n"
-            "Max per player: **Unlimited**\n"
-            f"Status: **{'Locked' if event['is_locked'] else 'Open'}**\n"
-            f"Active Category: **{CATEGORY_MAP[active_category]}**"
+            f"**Category:** {active_label}\n"
+            f"**Page:** {current_page}/{page_count}\n"
+            f"**Max per player:** Unlimited\n"
+            f"**Status:** {'Locked' if event['is_locked'] else 'Open'}"
         ),
         color=discord.Color.blurple()
     )
 
-    for cat in CATEGORY_KEYS:
-        embed.add_field(
-            name=CATEGORY_MAP[cat],
-            value=build_category_text(event, cat),
-            inline=False
-        )
-
     embed.add_field(
-        name="Priority Order",
-        value=build_priority_preview(event),
+        name=active_label,
+        value=build_current_page_details(event),
         inline=False
     )
 
     embed.add_field(
-        name="Current Page Details",
-        value=build_current_page_details(event),
+        name="Priority Order",
+        value=build_priority_preview(event),
         inline=False
     )
 
@@ -1308,15 +1302,12 @@ class PanelView(discord.ui.View):
     def __init__(self, ev_key: str):
         super().__init__(timeout=None)
 
-        # Row 0
         self.add_item(ItemSelect(ev_key))
 
-        # Row 1: first 5 categories
         row1_categories = CATEGORY_KEYS[:5]
         for cat in row1_categories:
             self.add_item(CategoryButton(ev_key, cat, row_num=1))
 
-        # Row 2: remaining 3 categories + prev + page info
         row2_categories = CATEGORY_KEYS[5:]
         for cat in row2_categories:
             self.add_item(CategoryButton(ev_key, cat, row_num=2))
@@ -1324,11 +1315,9 @@ class PanelView(discord.ui.View):
         self.add_item(PrevPageButton(ev_key))
         self.add_item(PageInfoButton(ev_key))
 
-        # Row 3
         self.add_item(NextPageButton(ev_key))
         self.add_item(RemoveMyItemButton(ev_key))
 
-        # Row 4
         self.add_item(AddItemButton(ev_key))
         self.add_item(EditCapButton(ev_key))
         self.add_item(RemoveItemButton(ev_key))
