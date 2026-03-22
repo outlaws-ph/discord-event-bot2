@@ -21,7 +21,7 @@ PRESET_EVENTS = [
 ]
 
 PRESET_EVENT_CHOICES = [
-    app_commands.Choice(name=x, value=x) for x in PRESET_EVENTS
+    app_commands.Choice(name=name, value=name) for name in PRESET_EVENTS
 ]
 
 CATEGORY_CHOICES = [
@@ -42,60 +42,111 @@ data_store = {
     "events": {}
 }
 
+
 # =========================
 # DATABASE
 # =========================
+def ensure_data_defaults(data: dict) -> dict:
+    if not isinstance(data, dict):
+        data = {}
+
+    if "global_items" not in data or not isinstance(data["global_items"], dict):
+        data["global_items"] = {
+            "main": {"items": {}},
+            "other": {"items": {}}
+        }
+
+    for cat in ["main", "other"]:
+        if cat not in data["global_items"] or not isinstance(data["global_items"][cat], dict):
+            data["global_items"][cat] = {"items": {}}
+        if "items" not in data["global_items"][cat] or not isinstance(data["global_items"][cat]["items"], dict):
+            data["global_items"][cat]["items"] = {}
+
+    if "events" not in data or not isinstance(data["events"], dict):
+        data["events"] = {}
+
+    return data
+
+
 async def init_db():
     global db_pool
+
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing.")
+
     db_pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
-        CREATE TABLE IF NOT EXISTS data (
-            id INT PRIMARY KEY,
-            json TEXT
-        )
+            CREATE TABLE IF NOT EXISTS data (
+                id INT PRIMARY KEY,
+                json TEXT
+            )
         """)
 
         await conn.execute("""
-        INSERT INTO data (id, json)
-        VALUES (1, '{}')
-        ON CONFLICT (id) DO NOTHING
+            INSERT INTO data (id, json)
+            VALUES (1, '{}')
+            ON CONFLICT (id) DO NOTHING
         """)
+
 
 async def load_data():
     global data_store
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT json FROM data WHERE id=1")
 
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT json FROM data WHERE id = 1")
+
+    raw = {}
     if row and row["json"]:
         try:
-            data_store = json.loads(row["json"])
-        except:
-            pass
+            raw = json.loads(row["json"])
+        except Exception:
+            raw = {}
+
+    data_store = ensure_data_defaults(raw)
+    await save_data()
+
 
 async def save_data():
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE data SET json=$1 WHERE id=1",
-            json.dumps(data_store)
+            "UPDATE data SET json = $1 WHERE id = 1",
+            json.dumps(data_store, ensure_ascii=False)
         )
+
 
 # =========================
 # HELPERS
 # =========================
-def now():
+def now_ts() -> float:
     return datetime.now(timezone.utc).timestamp()
 
-def key(x): return x.lower().strip()
 
-def make_event_key(e, d): return key(f"{e} {d}")
+def make_key(text: str) -> str:
+    return text.strip().lower()
 
-def ensure_event(e, d):
-    k = make_event_key(e, d)
-    if k not in data_store["events"]:
-        data_store["events"][k] = {
-            "name": f"{e} {d}",
+
+def normalize_item_name(name: str) -> str:
+    return " ".join(name.strip().split()).casefold()
+
+
+def make_event_display_name(base_event: str, run_date: str) -> str:
+    return f"{base_event} {run_date.strip()}"
+
+
+def make_event_key(base_event: str, run_date: str) -> str:
+    return make_key(make_event_display_name(base_event, run_date))
+
+
+def ensure_event(base_event: str, run_date: str):
+    ev_key = make_event_key(base_event, run_date)
+
+    if ev_key not in data_store["events"]:
+        data_store["events"][ev_key] = {
+            "base_event": base_event,
+            "run_date": run_date.strip(),
+            "name": make_event_display_name(base_event, run_date),
             "priority_order": [],
             "is_locked": False,
             "panel_channel_id": None,
@@ -105,177 +156,757 @@ def ensure_event(e, d):
                 "other": {"items": {}}
             }
         }
-    return data_store["events"][k]
 
-def find_global(item):
-    for c in ["main", "other"]:
-        for name, data in data_store["global_items"][c]["items"].items():
-            if name.lower() == item.lower():
-                return c, name, data
+    return data_store["events"][ev_key]
+
+
+def get_event(base_event: str, run_date: str):
+    return data_store["events"].get(make_event_key(base_event, run_date))
+
+
+def get_rank(event: dict, user_id: int) -> int:
+    try:
+        return event["priority_order"].index(user_id) + 1
+    except ValueError:
+        return 999999
+
+
+def item_exists_globally(item_name: str) -> bool:
+    target = normalize_item_name(item_name)
+    for cat in ["main", "other"]:
+        for existing_name in data_store["global_items"][cat]["items"].keys():
+            if normalize_item_name(existing_name) == target:
+                return True
+    return False
+
+
+def find_global_item(item_name: str):
+    target = normalize_item_name(item_name)
+    for cat in ["main", "other"]:
+        for existing_name, item_data in data_store["global_items"][cat]["items"].items():
+            if normalize_item_name(existing_name) == target:
+                return cat, existing_name, item_data
     return None, None, None
 
-# =========================
-# EMBED
-# =========================
-def build_embed(ev):
-    e = discord.Embed(
-        title=f"🎁 {ev['name']}",
-        description="Select items below",
+
+def item_exists_in_event(event: dict, item_name: str) -> bool:
+    target = normalize_item_name(item_name)
+    for cat in ["main", "other"]:
+        for existing_name in event["categories"][cat]["items"].keys():
+            if normalize_item_name(existing_name) == target:
+                return True
+    return False
+
+
+def auto_assign_leftovers(event: dict):
+    players = event["priority_order"]
+
+    for cat in event["categories"].values():
+        for item in cat["items"].values():
+            while len(item["selections"]) < item["capacity"]:
+                assigned = False
+
+                for user_id in players:
+                    if user_id in [x["user_id"] for x in item["selections"]]:
+                        continue
+
+                    item["selections"].append({
+                        "user_id": user_id,
+                        "selected_at": now_ts()
+                    })
+                    assigned = True
+                    break
+
+                if not assigned:
+                    break
+
+
+def build_category_text(event: dict, category_key: str) -> str:
+    items = event["categories"][category_key]["items"]
+    blocks = []
+
+    for item_name, item_data in items.items():
+        count = len(item_data["selections"])
+        cap = item_data["capacity"]
+        users = [f"<@{x['user_id']}>" for x in item_data["selections"]]
+
+        if users:
+            display_users = ", ".join(users[:6])
+            if len(users) > 6:
+                display_users += f" +{len(users) - 6} more"
+        else:
+            display_users = "—"
+
+        blocks.append(f"**{item_name}** `{count}/{cap}`\n{display_users}")
+
+    text = "\n\n".join(blocks)
+    return text[:1024] if text else "No items yet."
+
+
+def build_priority_preview(event: dict) -> str:
+    if not event["priority_order"]:
+        return "No priority players set."
+
+    lines = []
+    for i, user_id in enumerate(event["priority_order"][:10], start=1):
+        lines.append(f"{i}. <@{user_id}>")
+
+    if len(event["priority_order"]) > 10:
+        lines.append(f"+{len(event['priority_order']) - 10} more")
+
+    return "\n".join(lines)[:1024]
+
+
+def build_embed(event: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🎁 {event['name']}",
+        description=(
+            "Select items below.\n"
+            "Max per player: **Unlimited**\n"
+            f"Status: **{'Locked' if event['is_locked'] else 'Open'}**"
+        ),
         color=discord.Color.blurple()
     )
 
-    for c in ["main", "other"]:
-        txt = ""
-        for i, d in ev["categories"][c]["items"].items():
-            users = ", ".join(f"<@{x['user_id']}>" for x in d["selections"]) or "—"
-            txt += f"**{i}** ({len(d['selections'])}/{d['capacity']})\n{users}\n\n"
+    embed.add_field(
+        name="Main Items",
+        value=build_category_text(event, "main"),
+        inline=False
+    )
+    embed.add_field(
+        name="Other Items",
+        value=build_category_text(event, "other"),
+        inline=False
+    )
+    embed.add_field(
+        name="Priority Order",
+        value=build_priority_preview(event),
+        inline=False
+    )
 
-        e.add_field(
-            name="Main Items" if c=="main" else "Other Items",
-            value=txt or "No items",
-            inline=False
-        )
+    return embed
 
-    return e
 
-async def refresh(ev):
-    try:
-        ch = bot.get_channel(ev["panel_channel_id"])
-        msg = await ch.fetch_message(ev["panel_message_id"])
-        await msg.edit(embed=build_embed(ev), view=PanelView(key(ev["name"])))
-    except:
-        pass
+async def refresh_panel_by_event(event: dict):
+    channel_id = event.get("panel_channel_id")
+    message_id = event.get("panel_message_id")
 
-# =========================
-# UI SELECT
-# =========================
-class Select(discord.ui.Select):
-    def __init__(self, ev_key, cat):
-        self.ev_key = ev_key
-        self.cat = cat
-        ev = data_store["events"][ev_key]
+    if not channel_id or not message_id:
+        return
 
-        opts = [
-            discord.SelectOption(label=i, value=i)
-            for i in ev["categories"][cat]["items"].keys()
-        ]
-
-        super().__init__(
-            placeholder=f"Select {cat}",
-            options=opts[:25] or [discord.SelectOption(label="None", value="none")]
-        )
-
-    async def callback(self, interaction):
-        if self.values[0] == "none":
-            await interaction.response.send_message("No items", ephemeral=True)
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
             return
 
-        ev = data_store["events"][self.ev_key]
-        item = ev["categories"][self.cat]["items"][self.values[0]]
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.edit(
+            embed=build_embed(event),
+            view=PanelView(make_key(event["name"]))
+        )
+    except Exception as e:
+        print(f"Failed to refresh panel: {e}")
+
+
+# =========================
+# PANEL UI
+# =========================
+class ItemSelect(discord.ui.Select):
+    def __init__(self, ev_key: str, category_key: str):
+        self.ev_key = ev_key
+        self.category_key = category_key
+
+        event = data_store["events"][ev_key]
+        items = event["categories"][category_key]["items"]
+
+        options = [
+            discord.SelectOption(
+                label=item_name[:100],
+                value=item_name,
+                description=f"{len(item_data['selections'])}/{item_data['capacity']} reserved"
+            )
+            for item_name, item_data in items.items()
+        ]
+
+        placeholder = "Choose a main item" if category_key == "main" else "Choose an other item"
+
+        super().__init__(
+            custom_id=f"pick:{ev_key}:{category_key}",
+            placeholder=placeholder,
+            options=options[:25] if options else [
+                discord.SelectOption(label="No items available", value="__none__")
+            ],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("No items available.", ephemeral=True)
+            return
+
+        event = data_store["events"][self.ev_key]
+
+        if event["is_locked"]:
+            await interaction.response.send_message("❌ This panel is locked.", ephemeral=True)
+            return
+
+        selected_name = self.values[0]
+        item = event["categories"][self.category_key]["items"][selected_name]
 
         if interaction.user.id in [x["user_id"] for x in item["selections"]]:
-            await interaction.response.send_message("Already selected", ephemeral=True)
+            await interaction.response.send_message("You already selected this item.", ephemeral=True)
             return
 
         if len(item["selections"]) >= item["capacity"]:
-            lowest = item["selections"][-1]
-            item["selections"].remove(lowest)
+            lowest = max(
+                item["selections"],
+                key=lambda x: (get_rank(event, x["user_id"]), x["selected_at"])
+            )
+            if get_rank(event, interaction.user.id) < get_rank(event, lowest["user_id"]):
+                item["selections"].remove(lowest)
+            else:
+                await interaction.response.send_message("❌ This item is full.", ephemeral=True)
+                return
 
-        item["selections"].append({"user_id": interaction.user.id, "t": now()})
+        item["selections"].append({
+            "user_id": interaction.user.id,
+            "selected_at": now_ts()
+        })
 
         await save_data()
-        await refresh(ev)
-        await interaction.response.send_message("✅ Selected", ephemeral=True)
+        await refresh_panel_by_event(event)
+        await interaction.response.send_message(f"✅ You selected **{selected_name}**.", ephemeral=True)
+
+
+class RemoveSelect(discord.ui.Select):
+    def __init__(self, ev_key: str):
+        self.ev_key = ev_key
+        event = data_store["events"][ev_key]
+
+        options = []
+        for cat in ["main", "other"]:
+            for item_name, item_data in event["categories"][cat]["items"].items():
+                options.append(
+                    discord.SelectOption(
+                        label=item_name[:100],
+                        value=f"{cat}|{item_name}",
+                        description=f"{len(item_data['selections'])}/{item_data['capacity']} reserved"
+                    )
+                )
+
+        super().__init__(
+            custom_id=f"remove:{ev_key}",
+            placeholder="Remove one of your selected items",
+            options=options[:25] if options else [
+                discord.SelectOption(label="No items available", value="__none__")
+            ],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("No items available.", ephemeral=True)
+            return
+
+        event = data_store["events"][self.ev_key]
+
+        if event["is_locked"]:
+            await interaction.response.send_message("❌ This panel is locked.", ephemeral=True)
+            return
+
+        cat, item_name = self.values[0].split("|", 1)
+        item = event["categories"][cat]["items"][item_name]
+
+        before = len(item["selections"])
+        item["selections"] = [x for x in item["selections"] if x["user_id"] != interaction.user.id]
+
+        if len(item["selections"]) == before:
+            await interaction.response.send_message("You did not select that item.", ephemeral=True)
+            return
+
+        await save_data()
+        await refresh_panel_by_event(event)
+        await interaction.response.send_message(f"🗑️ Removed **{item_name}**.", ephemeral=True)
+
+
+class EditCapItemSelect(discord.ui.Select):
+    def __init__(self, ev_key: str):
+        self.ev_key = ev_key
+        event = data_store["events"][ev_key]
+
+        options = []
+        for cat in ["main", "other"]:
+            for item_name, item_data in event["categories"][cat]["items"].items():
+                options.append(
+                    discord.SelectOption(
+                        label=item_name[:100],
+                        value=f"{cat}|{item_name}",
+                        description=f"Current cap: {item_data['capacity']}"
+                    )
+                )
+
+        super().__init__(
+            placeholder="Select item to edit cap",
+            options=options[:25] if options else [
+                discord.SelectOption(label="No items available", value="__none__")
+            ],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("No items available.", ephemeral=True)
+            return
+
+        cat, item_name = self.values[0].split("|", 1)
+        await interaction.response.send_modal(EditCapModal(self.ev_key, cat, item_name))
+
+
+class EditCapModal(discord.ui.Modal, title="Set New Cap"):
+    new_cap = discord.ui.TextInput(label="New cap", required=True, max_length=3)
+
+    def __init__(self, ev_key: str, category_key: str, item_name: str):
+        super().__init__()
+        self.ev_key = ev_key
+        self.category_key = category_key
+        self.item_name = item_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            cap = int(self.new_cap.value)
+            if cap < 1:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌ Cap must be a whole number greater than 0.", ephemeral=True)
+            return
+
+        event = data_store["events"][self.ev_key]
+        item = event["categories"][self.category_key]["items"][self.item_name]
+        item["capacity"] = cap
+
+        if len(item["selections"]) > cap:
+            item["selections"].sort(key=lambda x: (get_rank(event, x["user_id"]), x["selected_at"]))
+            item["selections"] = item["selections"][:cap]
+
+        await save_data()
+        await refresh_panel_by_event(event)
+        await interaction.response.send_message(
+            f"✅ Updated **{self.item_name}** cap to **{cap}**.",
+            ephemeral=True
+        )
+
+
+class EditCapButton(discord.ui.Button):
+    def __init__(self, ev_key: str):
+        super().__init__(
+            label="✏️ Edit Cap",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"editcap:{ev_key}"
+        )
+        self.ev_key = ev_key
+
+    async def callback(self, interaction: discord.Interaction):
+        view = discord.ui.View()
+        view.add_item(EditCapItemSelect(self.ev_key))
+        await interaction.response.send_message("Select item to edit:", view=view, ephemeral=True)
+
 
 class PanelView(discord.ui.View):
-    def __init__(self, ev_key):
+    def __init__(self, ev_key: str):
         super().__init__(timeout=None)
-        self.add_item(Select(ev_key, "main"))
-        self.add_item(Select(ev_key, "other"))
+        self.add_item(ItemSelect(ev_key, "main"))
+        self.add_item(ItemSelect(ev_key, "other"))
+        self.add_item(RemoveSelect(ev_key))
+        self.add_item(EditCapButton(ev_key))
+
 
 # =========================
 # COMMANDS
 # =========================
-
-@bot.tree.command(name="add_item")
-@app_commands.choices(category=CATEGORY_CHOICES)
-async def add_item(interaction, category, item_name: str, cap: int):
+@bot.tree.command(name="create_event", description="Create a dated event from preset list")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def create_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
     await interaction.response.defer(ephemeral=True)
 
-    data_store["global_items"][category.value]["items"][item_name] = {
-        "capacity": cap
-    }
-
+    ev = ensure_event(event.value, run_date)
     await save_data()
-    await interaction.followup.send(f"✅ Added {item_name}")
 
-# 🔥 DROPDOWN ITEM SELECTOR
-@bot.tree.command(name="add_item_to_event")
+    await interaction.followup.send(
+        f"✅ Event **{ev['name']}** created.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="create_panel", description="Create a panel from preset event list")
 @app_commands.choices(event=PRESET_EVENT_CHOICES)
-async def add_item_to_event(interaction, event, run_date: str):
+async def create_panel(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
     await interaction.response.defer(ephemeral=True)
 
     ev = ensure_event(event.value, run_date)
-
-    # BUILD DROPDOWN
-    opts = []
-    for c in ["main", "other"]:
-        for i in data_store["global_items"][c]["items"].keys():
-            opts.append(discord.SelectOption(label=i, value=i))
-
-    class Picker(discord.ui.Select):
-        def __init__(self):
-            super().__init__(options=opts[:25])
-
-        async def callback(self, i):
-            cat, name, data = find_global(self.values[0])
-
-            if name in ev["categories"][cat]["items"]:
-                await i.response.send_message("Already added", ephemeral=True)
-                return
-
-            ev["categories"][cat]["items"][name] = {
-                "capacity": data["capacity"],
-                "selections": []
-            }
-
-            await save_data()
-            await refresh(ev)
-            await i.response.send_message(f"✅ Added {name}", ephemeral=True)
-
-    view = discord.ui.View()
-    view.add_item(Picker())
-
-    await interaction.followup.send("Select item to add:", view=view, ephemeral=True)
-
-@bot.tree.command(name="create_panel")
-@app_commands.choices(event=PRESET_EVENT_CHOICES)
-async def create_panel(interaction, event, run_date: str):
-    await interaction.response.defer(ephemeral=True)
-
-    ev = ensure_event(event.value, run_date)
-
     msg = await interaction.channel.send(
         embed=build_embed(ev),
-        view=PanelView(key(ev["name"]))
+        view=PanelView(make_key(ev["name"]))
     )
 
     ev["panel_channel_id"] = interaction.channel.id
     ev["panel_message_id"] = msg.id
 
     await save_data()
-    await interaction.followup.send("✅ Panel created", ephemeral=True)
+    await interaction.followup.send(
+        f"✅ Panel created for **{ev['name']}**.",
+        ephemeral=True
+    )
 
-@bot.tree.command(name="remove_event")
+
+@bot.tree.command(name="remove_event", description="Remove a dated event")
 @app_commands.choices(event=PRESET_EVENT_CHOICES)
-async def remove_event(interaction, event, run_date: str):
+async def remove_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
     await interaction.response.defer(ephemeral=True)
 
-    k = make_event_key(event.value, run_date)
-    data_store["events"].pop(k, None)
+    ev_key = make_event_key(event.value, run_date)
+    ev = data_store["events"].get(ev_key)
+
+    if not ev:
+        await interaction.followup.send("❌ Event not found.", ephemeral=True)
+        return
+
+    del data_store["events"][ev_key]
+    await save_data()
+
+    await interaction.followup.send(
+        f"✅ Removed **{event.value} {run_date}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="add_item", description="Add an item to the global item library")
+@app_commands.choices(category=CATEGORY_CHOICES)
+async def add_item(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str],
+    item_name: str,
+    cap: app_commands.Range[int, 1, 99]
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if item_exists_globally(item_name):
+        await interaction.followup.send("❌ That item already exists in the global library.", ephemeral=True)
+        return
+
+    data_store["global_items"][category.value]["items"][item_name] = {
+        "capacity": cap
+    }
 
     await save_data()
-    await interaction.followup.send("✅ Event removed", ephemeral=True)
+    await interaction.followup.send(
+        f"✅ Added **{item_name}** to global **{category.name}** with cap **{cap}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="add_item_to_event", description="Add one global item to an event with a custom cap")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def add_item_to_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str,
+    cap: app_commands.Range[int, 1, 99]
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = ensure_event(event.value, run_date)
+
+    options = []
+    for cat in ["main", "other"]:
+        for item_name in data_store["global_items"][cat]["items"].keys():
+            options.append(
+                discord.SelectOption(label=item_name[:100], value=item_name)
+            )
+
+    if not options:
+        await interaction.followup.send("❌ No global items available yet.", ephemeral=True)
+        return
+
+    class SinglePicker(discord.ui.Select):
+        def __init__(self):
+            super().__init__(
+                placeholder=f"Select one item (cap = {cap})",
+                options=options[:25],
+                min_values=1,
+                max_values=1
+            )
+
+        async def callback(self, i: discord.Interaction):
+            cat, name, _ = find_global_item(self.values[0])
+
+            if not name:
+                await i.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+
+            if name in ev["categories"][cat]["items"]:
+                await i.response.send_message("❌ Item already added to this event.", ephemeral=True)
+                return
+
+            ev["categories"][cat]["items"][name] = {
+                "capacity": cap,
+                "selections": []
+            }
+
+            await save_data()
+            await refresh_panel_by_event(ev)
+            await i.response.send_message(
+                f"✅ Added **{name}** to **{ev['name']}** with cap **{cap}**.",
+                ephemeral=True
+            )
+
+    view = discord.ui.View()
+    view.add_item(SinglePicker())
+    await interaction.followup.send("Select item to add:", view=view, ephemeral=True)
+
+
+@bot.tree.command(name="add_items_bulk", description="Add multiple global items to an event with one shared cap")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def add_items_bulk(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str,
+    cap: app_commands.Range[int, 1, 99]
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = ensure_event(event.value, run_date)
+
+    options = []
+    for cat in ["main", "other"]:
+        for item_name in data_store["global_items"][cat]["items"].keys():
+            options.append(
+                discord.SelectOption(label=item_name[:100], value=item_name)
+            )
+
+    if not options:
+        await interaction.followup.send("❌ No global items available yet.", ephemeral=True)
+        return
+
+    class BulkPicker(discord.ui.Select):
+        def __init__(self):
+            super().__init__(
+                placeholder=f"Select multiple items (cap = {cap})",
+                options=options[:25],
+                min_values=1,
+                max_values=min(25, len(options))
+            )
+
+        async def callback(self, i: discord.Interaction):
+            added = []
+
+            for selected in self.values:
+                cat, name, _ = find_global_item(selected)
+
+                if not name:
+                    continue
+
+                if name in ev["categories"][cat]["items"]:
+                    continue
+
+                ev["categories"][cat]["items"][name] = {
+                    "capacity": cap,
+                    "selections": []
+                }
+                added.append(name)
+
+            await save_data()
+            await refresh_panel_by_event(ev)
+
+            if added:
+                await i.response.send_message(
+                    f"✅ Added with cap **{cap}**: {', '.join(added)}",
+                    ephemeral=True
+                )
+            else:
+                await i.response.send_message(
+                    "⚠️ All selected items were already added to this event.",
+                    ephemeral=True
+                )
+
+    view = discord.ui.View()
+    view.add_item(BulkPicker())
+    await interaction.followup.send("Select items to add:", view=view, ephemeral=True)
+
+
+@bot.tree.command(name="remove_item_from_event", description="Remove an item from one event only")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def remove_item_from_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str,
+    item_name: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = get_event(event.value, run_date)
+    if not ev:
+        await interaction.followup.send("❌ Event not found.", ephemeral=True)
+        return
+
+    for cat in ["main", "other"]:
+        for existing_name in list(ev["categories"][cat]["items"].keys()):
+            if normalize_item_name(existing_name) == normalize_item_name(item_name):
+                del ev["categories"][cat]["items"][existing_name]
+                await save_data()
+                await refresh_panel_by_event(ev)
+                await interaction.followup.send(
+                    f"✅ Removed **{existing_name}** from **{ev['name']}**.",
+                    ephemeral=True
+                )
+                return
+
+    await interaction.followup.send("❌ Item not found in this event.", ephemeral=True)
+
+
+@bot.tree.command(name="add_priority", description="Add a priority player to a dated event")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def add_priority(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str,
+    user: discord.Member
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = ensure_event(event.value, run_date)
+    if user.id not in ev["priority_order"]:
+        ev["priority_order"].append(user.id)
+
+    await save_data()
+    await refresh_panel_by_event(ev)
+    await interaction.followup.send(
+        f"✅ Added {user.mention} to priority for **{ev['name']}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="remove_priority", description="Remove a priority player from a dated event")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def remove_priority(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str,
+    user: discord.Member
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = get_event(event.value, run_date)
+    if not ev:
+        await interaction.followup.send("❌ Event not found.", ephemeral=True)
+        return
+
+    if user.id not in ev["priority_order"]:
+        await interaction.followup.send("❌ User is not in the priority list.", ephemeral=True)
+        return
+
+    ev["priority_order"].remove(user.id)
+
+    await save_data()
+    await refresh_panel_by_event(ev)
+    await interaction.followup.send(
+        f"✅ Removed {user.mention} from priority for **{ev['name']}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="lock_event", description="Lock event, auto-assign leftovers, and announce winners")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def lock_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = ensure_event(event.value, run_date)
+    auto_assign_leftovers(ev)
+    ev["is_locked"] = True
+
+    winners = [f"🏆 **Winners — {ev['name']}**", ""]
+    for cat in ["main", "other"]:
+        for item_name, item_data in ev["categories"][cat]["items"].items():
+            if item_data["selections"]:
+                users = ", ".join([f"<@{x['user_id']}>" for x in item_data["selections"]])
+                winners.append(f"**{item_name}**: {users}")
+
+    await save_data()
+    await refresh_panel_by_event(ev)
+
+    await interaction.channel.send("\n".join(winners))
+    await interaction.followup.send(f"✅ Event **{ev['name']}** locked.", ephemeral=True)
+
+
+@bot.tree.command(name="unlock_event", description="Unlock a dated event")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def unlock_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = get_event(event.value, run_date)
+    if not ev:
+        await interaction.followup.send("❌ Event not found.", ephemeral=True)
+        return
+
+    ev["is_locked"] = False
+    await save_data()
+    await refresh_panel_by_event(ev)
+
+    await interaction.followup.send(f"✅ Event **{ev['name']}** unlocked.", ephemeral=True)
+
+
+@bot.tree.command(name="show_events", description="Show all created dated events")
+async def show_events(interaction: discord.Interaction):
+    if not data_store["events"]:
+        await interaction.response.send_message("No events yet.", ephemeral=True)
+        return
+
+    names = [f"• {ev['name']}" for ev in data_store["events"].values()]
+    await interaction.response.send_message("\n".join(names[:100]), ephemeral=True)
+
+
+@bot.tree.command(name="show_items", description="Show all global library items")
+async def show_items(interaction: discord.Interaction):
+    main_items = list(data_store["global_items"]["main"]["items"].keys())
+    other_items = list(data_store["global_items"]["other"]["items"].keys())
+
+    main_text = "\n".join(f"• {x}" for x in main_items[:50]) if main_items else "None"
+    other_text = "\n".join(f"• {x}" for x in other_items[:50]) if other_items else "None"
+
+    embed = discord.Embed(
+        title="Global Item Library",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Main Items", value=main_text[:1024], inline=False)
+    embed.add_field(name="Other Items", value=other_text[:1024], inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 # =========================
 # READY
@@ -285,10 +916,11 @@ async def on_ready():
     await init_db()
     await load_data()
 
-    for k in data_store["events"]:
-        bot.add_view(PanelView(k))
+    for ev_key in data_store["events"].keys():
+        bot.add_view(PanelView(ev_key))
 
     await bot.tree.sync()
     print("READY")
+
 
 bot.run(TOKEN)
