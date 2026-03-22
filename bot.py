@@ -283,6 +283,19 @@ def is_admin(interaction: discord.Interaction) -> bool:
     return isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
 
 
+def build_global_item_options():
+    options = []
+    for cat in ["main", "other"]:
+        for item_name in sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower):
+            options.append(
+                discord.SelectOption(
+                    label=item_name[:100],
+                    value=f"{cat}|{item_name}"
+                )
+            )
+    return options
+
+
 async def refresh_panel_by_event(event: dict):
     channel_id = event.get("panel_channel_id")
     message_id = event.get("panel_message_id")
@@ -521,10 +534,7 @@ class AddItemSingleSelect(discord.ui.Select):
         self.ev_key = ev_key
         self.cap = cap
 
-        options = []
-        for cat in ["main", "other"]:
-            for item_name in sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower):
-                options.append(discord.SelectOption(label=item_name[:100], value=item_name))
+        options = build_global_item_options()
 
         super().__init__(
             placeholder=f"Select one item (cap = {cap})",
@@ -541,11 +551,7 @@ class AddItemSingleSelect(discord.ui.Select):
             return
 
         event = data_store["events"][self.ev_key]
-        cat, name, _ = find_global_item(self.values[0])
-
-        if not name:
-            await interaction.response.send_message("❌ Item not found.", ephemeral=True)
-            return
+        cat, name = self.values[0].split("|", 1)
 
         if name in event["categories"][cat]["items"]:
             await interaction.response.send_message("❌ Item already added to this event.", ephemeral=True)
@@ -569,10 +575,7 @@ class AddItemBulkSelect(discord.ui.Select):
         self.ev_key = ev_key
         self.cap = cap
 
-        options = []
-        for cat in ["main", "other"]:
-            for item_name in sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower):
-                options.append(discord.SelectOption(label=item_name[:100], value=item_name))
+        options = build_global_item_options()
 
         super().__init__(
             placeholder=f"Select multiple items (cap = {cap})",
@@ -592,9 +595,8 @@ class AddItemBulkSelect(discord.ui.Select):
         added = []
 
         for selected in self.values:
-            cat, name, _ = find_global_item(selected)
-            if not name:
-                continue
+            cat, name = selected.split("|", 1)
+
             if name in event["categories"][cat]["items"]:
                 continue
 
@@ -619,6 +621,108 @@ class AddItemBulkSelect(discord.ui.Select):
             )
 
 
+class SearchItemSelect(discord.ui.Select):
+    def __init__(self, ev_key: str, cap: int, results):
+        self.ev_key = ev_key
+        self.cap = cap
+
+        options = [
+            discord.SelectOption(
+                label=name[:100],
+                value=f"{cat}|{name}"
+            )
+            for cat, name in results[:25]
+        ]
+
+        super().__init__(
+            placeholder=f"Search results (cap = {cap})",
+            options=options if options else [
+                discord.SelectOption(label="No results found", value="__none__")
+            ],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("No matching items found.", ephemeral=True)
+            return
+
+        event = data_store["events"][self.ev_key]
+        cat, name = self.values[0].split("|", 1)
+
+        if name in event["categories"][cat]["items"]:
+            await interaction.response.send_message("❌ Item already added to this event.", ephemeral=True)
+            return
+
+        event["categories"][cat]["items"][name] = {
+            "capacity": self.cap,
+            "selections": []
+        }
+
+        await save_data()
+        await refresh_panel_by_event(event)
+        await interaction.response.send_message(
+            f"✅ Added **{name}** with cap **{self.cap}**.",
+            ephemeral=True
+        )
+
+
+class SearchItemModal(discord.ui.Modal, title="Search Global Item"):
+    query = discord.ui.TextInput(label="Search item name", required=True, max_length=100)
+    cap_input = discord.ui.TextInput(label="Cap for this item", required=True, max_length=3)
+
+    def __init__(self, ev_key: str):
+        super().__init__()
+        self.ev_key = ev_key
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            cap = int(self.cap_input.value)
+            if cap < 1:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌ Cap must be a whole number greater than 0.", ephemeral=True)
+            return
+
+        q = normalize_item_name(self.query.value)
+        results = []
+
+        for cat in ["main", "other"]:
+            for item_name in sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower):
+                if q in normalize_item_name(item_name):
+                    results.append((cat, item_name))
+
+        if not results:
+            await interaction.response.send_message("❌ No matching global items found.", ephemeral=True)
+            return
+
+        view = discord.ui.View()
+        view.add_item(SearchItemSelect(self.ev_key, cap, results))
+        await interaction.response.send_message("Select search result:", view=view, ephemeral=True)
+
+
+class SearchItemButton(discord.ui.Button):
+    def __init__(self, ev_key: str):
+        super().__init__(label="🔍 Search Item", style=discord.ButtonStyle.secondary, custom_id=f"searchitem:{ev_key}")
+        self.ev_key = ev_key
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+
+        has_global_items = any(
+            data_store["global_items"][cat]["items"]
+            for cat in ["main", "other"]
+        )
+        if not has_global_items:
+            await interaction.response.send_message("❌ No global items available yet.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(SearchItemModal(self.ev_key))
+
+
 class AddItemModeView(discord.ui.View):
     def __init__(self, ev_key: str):
         super().__init__(timeout=300)
@@ -631,6 +735,10 @@ class AddItemModeView(discord.ui.View):
     @discord.ui.button(label="Bulk Add", style=discord.ButtonStyle.secondary)
     async def bulk_add(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AddItemBulkCapModal(self.ev_key))
+
+    @discord.ui.button(label="🔍 Search Item", style=discord.ButtonStyle.success)
+    async def search_item(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SearchItemModal(self.ev_key))
 
 
 class AddItemSingleCapModal(discord.ui.Modal, title="Add One Item"):
@@ -898,6 +1006,7 @@ async def create_panel(
     ev["panel_message_id"] = msg.id
 
     await save_data()
+
     await interaction.followup.send(f"✅ Panel created for **{ev['name']}**.", ephemeral=True)
 
 
