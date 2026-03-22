@@ -23,9 +23,13 @@ PRESET_EVENTS = [
 
 CATEGORY_MAP = {
     "equipment": "Equipment",
-    "material": "Material",
-    "consumable": "Consumable",
-    "currency": "Currency",
+    "materials_stones": "Materials/Stones",
+    "soul_horn": "Soul/Horn",
+    "radiant_darkening_stone": "Radiant/Darkening Stone",
+    "brokks_items": "Brokk's Items",
+    "artisan": "Artisan",
+    "skill_tomes": "Skill Tomes",
+    "other_materials": "Other Materials",
 }
 
 CATEGORY_KEYS = list(CATEGORY_MAP.keys())
@@ -74,6 +78,7 @@ def ensure_data_defaults(data: dict) -> dict:
     for ev in data["events"].values():
         if "categories" not in ev or not isinstance(ev["categories"], dict):
             ev["categories"] = {}
+
         for cat in CATEGORY_KEYS:
             if cat not in ev["categories"] or not isinstance(ev["categories"][cat], dict):
                 ev["categories"][cat] = {"items": {}}
@@ -82,8 +87,10 @@ def ensure_data_defaults(data: dict) -> dict:
 
         if "ui_state" not in ev or not isinstance(ev["ui_state"], dict):
             ev["ui_state"] = {}
+
         if ev["ui_state"].get("category") not in CATEGORY_KEYS:
-            ev["ui_state"]["category"] = "equipment"
+            ev["ui_state"]["category"] = CATEGORY_KEYS[0]
+
         if not isinstance(ev["ui_state"].get("page"), int) or ev["ui_state"]["page"] < 0:
             ev["ui_state"]["page"] = 0
 
@@ -175,7 +182,7 @@ def ensure_event(base_event: str, run_date: str):
             "panel_message_id": None,
             "categories": {k: {"items": {}} for k in CATEGORY_KEYS},
             "ui_state": {
-                "category": "equipment",
+                "category": CATEGORY_KEYS[0],
                 "page": 0
             }
         }
@@ -247,15 +254,16 @@ def get_page_count(event: dict, category_key: str) -> int:
 
 
 def clamp_page(event: dict):
-    category = event["ui_state"].get("category", "equipment")
+    category = event["ui_state"].get("category", CATEGORY_KEYS[0])
     if category not in CATEGORY_KEYS:
-        category = "equipment"
+        category = CATEGORY_KEYS[0]
         event["ui_state"]["category"] = category
 
     max_pages = get_page_count(event, category)
     page = event["ui_state"].get("page", 0)
     if not isinstance(page, int):
         page = 0
+
     page = max(0, min(page, max_pages - 1))
     event["ui_state"]["page"] = page
 
@@ -268,6 +276,7 @@ def get_current_page_items(event: dict):
     all_items = get_sorted_items_for_category(event, category)
     start = page * ITEMS_PER_PAGE
     end = start + ITEMS_PER_PAGE
+
     return category, page, all_items[start:end]
 
 
@@ -306,10 +315,11 @@ def auto_assign_leftovers(event: dict):
 def build_category_text(event: dict, category_key: str) -> str:
     items = event["categories"][category_key]["items"]
     if not items:
-        return f"No {CATEGORY_MAP[category_key].lower()} items yet."
+        return "None"
 
     all_items = sorted(items.items(), key=lambda x: x[0].lower())
     lines = []
+
     for item_name, item_data in all_items[:20]:
         count = len(item_data["selections"])
         cap = item_data["capacity"]
@@ -344,6 +354,7 @@ def build_current_page_details(event: dict) -> str:
         return f"**{CATEGORY_MAP[category]}** — Page **{page + 1}/{page_count}**\nNo items on this page."
 
     blocks = [f"**{CATEGORY_MAP[category]}** — Page **{page + 1}/{page_count}**", ""]
+
     for item_name, item_data in page_items:
         count = len(item_data["selections"])
         cap = item_data["capacity"]
@@ -360,8 +371,7 @@ def build_current_page_details(event: dict) -> str:
         blocks.append(display_users)
         blocks.append("")
 
-    text = "\n".join(blocks).strip()
-    return text[:4096]
+    return "\n".join(blocks).strip()[:4096]
 
 
 def build_embed(event: dict) -> discord.Embed:
@@ -379,11 +389,18 @@ def build_embed(event: dict) -> discord.Embed:
         color=discord.Color.blurple()
     )
 
-    embed.add_field(name="Equipment", value=build_category_text(event, "equipment"), inline=False)
-    embed.add_field(name="Material", value=build_category_text(event, "material"), inline=False)
-    embed.add_field(name="Consumable", value=build_category_text(event, "consumable"), inline=False)
-    embed.add_field(name="Currency", value=build_category_text(event, "currency"), inline=False)
-    embed.add_field(name="Priority Order", value=build_priority_preview(event), inline=False)
+    for cat in CATEGORY_KEYS:
+        embed.add_field(
+            name=CATEGORY_MAP[cat],
+            value=build_category_text(event, cat),
+            inline=False
+        )
+
+    embed.add_field(
+        name="Priority Order",
+        value=build_priority_preview(event),
+        inline=False
+    )
 
     embed.add_field(
         name="Current Page Details",
@@ -565,18 +582,10 @@ class RemoveMyItemSelect(discord.ui.Select):
         await refresh_panel_by_event(event)
 
         new_view = RemoveMyItemView(self.ev_key, interaction.user.id, page=self.page, query=self.query)
-        content = f"🗑️ Removed **{item_name}**."
-        if interaction.response.is_done():
-            await interaction.followup.edit_message(
-                interaction.message.id,
-                content=content,
-                view=new_view
-            )
-        else:
-            await interaction.response.edit_message(
-                content=content,
-                view=new_view
-            )
+        await interaction.response.edit_message(
+            content=f"🗑️ Removed **{item_name}**.",
+            view=new_view
+        )
 
 
 class RemoveMyItemSearchModal(discord.ui.Modal, title="Search My Selected Items"):
@@ -716,15 +725,15 @@ class RemoveMyItemButton(discord.ui.Button):
 # CATEGORY / PAGE CONTROLS
 # =========================
 class CategoryButton(discord.ui.Button):
-    def __init__(self, ev_key: str, category_key: str):
+    def __init__(self, ev_key: str, category_key: str, row_num: int):
         event = data_store["events"][ev_key]
         active = event["ui_state"].get("category") == category_key
 
         super().__init__(
-            label=CATEGORY_MAP[category_key],
+            label=CATEGORY_MAP[category_key][:80],
             style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
             custom_id=f"cat:{ev_key}:{category_key}",
-            row=1
+            row=row_num
         )
         self.ev_key = ev_key
         self.category_key = category_key
@@ -786,7 +795,7 @@ class NextPageButton(discord.ui.Button):
             label="Next ➡️",
             style=discord.ButtonStyle.secondary,
             custom_id=f"next:{ev_key}",
-            row=2
+            row=3
         )
         self.ev_key = ev_key
 
@@ -1169,7 +1178,6 @@ class RemoveItemFromPanelSelect(discord.ui.Select):
             return
 
         del event["categories"][cat]["items"][item_name]
-
         clamp_page(event)
 
         await save_data()
@@ -1300,19 +1308,27 @@ class PanelView(discord.ui.View):
     def __init__(self, ev_key: str):
         super().__init__(timeout=None)
 
+        # Row 0
         self.add_item(ItemSelect(ev_key))
 
-        self.add_item(CategoryButton(ev_key, "equipment"))
-        self.add_item(CategoryButton(ev_key, "material"))
-        self.add_item(CategoryButton(ev_key, "consumable"))
-        self.add_item(CategoryButton(ev_key, "currency"))
+        # Row 1: first 5 categories
+        row1_categories = CATEGORY_KEYS[:5]
+        for cat in row1_categories:
+            self.add_item(CategoryButton(ev_key, cat, row_num=1))
+
+        # Row 2: remaining 3 categories + prev + page info
+        row2_categories = CATEGORY_KEYS[5:]
+        for cat in row2_categories:
+            self.add_item(CategoryButton(ev_key, cat, row_num=2))
 
         self.add_item(PrevPageButton(ev_key))
         self.add_item(PageInfoButton(ev_key))
-        self.add_item(NextPageButton(ev_key))
 
+        # Row 3
+        self.add_item(NextPageButton(ev_key))
         self.add_item(RemoveMyItemButton(ev_key))
 
+        # Row 4
         self.add_item(AddItemButton(ev_key))
         self.add_item(EditCapButton(ev_key))
         self.add_item(RemoveItemButton(ev_key))
@@ -1357,7 +1373,6 @@ async def create_panel(
     ev["panel_message_id"] = msg.id
 
     await save_data()
-
     await interaction.followup.send(f"✅ Panel created for **{ev['name']}**.", ephemeral=True)
 
 
@@ -1462,11 +1477,18 @@ async def add_global_items_bulk(
 
     parts = []
     if added:
-        parts.append(f"✅ Added to global **{category.name}** with cap **{cap}**:\n" + "\n".join(f"• {x}" for x in added[:50]))
+        parts.append(
+            f"✅ Added to global **{category.name}** with cap **{cap}**:\n" +
+            "\n".join(f"• {x}" for x in added[:50])
+        )
         if len(added) > 50:
             parts.append(f"…and {len(added) - 50} more added.")
+
     if skipped:
-        parts.append("⚠️ Skipped duplicates:\n" + "\n".join(f"• {x}" for x in skipped[:50]))
+        parts.append(
+            "⚠️ Skipped duplicates:\n" +
+            "\n".join(f"• {x}" for x in skipped[:50])
+        )
         if len(skipped) > 50:
             parts.append(f"…and {len(skipped) - 50} more skipped.")
 
