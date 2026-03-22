@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from datetime import datetime, timezone
 
 import asyncpg
@@ -20,14 +21,25 @@ PRESET_EVENTS = [
     "Guild Dungeon",
 ]
 
+CATEGORY_MAP = {
+    "equipment": "Equipment",
+    "material": "Material",
+    "consumable": "Consumable",
+    "currency": "Currency",
+}
+
+CATEGORY_KEYS = list(CATEGORY_MAP.keys())
+
 PRESET_EVENT_CHOICES = [
     app_commands.Choice(name=name, value=name) for name in PRESET_EVENTS
 ]
 
 CATEGORY_CHOICES = [
-    app_commands.Choice(name="Main Items", value="main"),
-    app_commands.Choice(name="Other Items", value="other"),
+    app_commands.Choice(name=label, value=key)
+    for key, label in CATEGORY_MAP.items()
 ]
+
+ITEMS_PER_PAGE = 25
 
 intents = discord.Intents.default()
 intents.members = True
@@ -35,10 +47,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool = None
 data_store = {
-    "global_items": {
-        "main": {"items": {}},
-        "other": {"items": {}}
-    },
+    "global_items": {k: {"items": {}} for k in CATEGORY_KEYS},
     "events": {}
 }
 
@@ -51,12 +60,9 @@ def ensure_data_defaults(data: dict) -> dict:
         data = {}
 
     if "global_items" not in data or not isinstance(data["global_items"], dict):
-        data["global_items"] = {
-            "main": {"items": {}},
-            "other": {"items": {}}
-        }
+        data["global_items"] = {}
 
-    for cat in ["main", "other"]:
+    for cat in CATEGORY_KEYS:
         if cat not in data["global_items"] or not isinstance(data["global_items"][cat], dict):
             data["global_items"][cat] = {"items": {}}
         if "items" not in data["global_items"][cat] or not isinstance(data["global_items"][cat]["items"], dict):
@@ -64,6 +70,22 @@ def ensure_data_defaults(data: dict) -> dict:
 
     if "events" not in data or not isinstance(data["events"], dict):
         data["events"] = {}
+
+    for ev in data["events"].values():
+        if "categories" not in ev or not isinstance(ev["categories"], dict):
+            ev["categories"] = {}
+        for cat in CATEGORY_KEYS:
+            if cat not in ev["categories"] or not isinstance(ev["categories"][cat], dict):
+                ev["categories"][cat] = {"items": {}}
+            if "items" not in ev["categories"][cat] or not isinstance(ev["categories"][cat]["items"], dict):
+                ev["categories"][cat]["items"] = {}
+
+        if "ui_state" not in ev or not isinstance(ev["ui_state"], dict):
+            ev["ui_state"] = {}
+        if ev["ui_state"].get("category") not in CATEGORY_KEYS:
+            ev["ui_state"]["category"] = "equipment"
+        if not isinstance(ev["ui_state"].get("page"), int) or ev["ui_state"]["page"] < 0:
+            ev["ui_state"]["page"] = 0
 
     return data
 
@@ -151,9 +173,10 @@ def ensure_event(base_event: str, run_date: str):
             "is_locked": False,
             "panel_channel_id": None,
             "panel_message_id": None,
-            "categories": {
-                "main": {"items": {}},
-                "other": {"items": {}}
+            "categories": {k: {"items": {}} for k in CATEGORY_KEYS},
+            "ui_state": {
+                "category": "equipment",
+                "page": 0
             }
         }
 
@@ -173,7 +196,7 @@ def get_rank(event: dict, user_id: int) -> int:
 
 def item_exists_globally(item_name: str) -> bool:
     target = normalize_item_name(item_name)
-    for cat in ["main", "other"]:
+    for cat in CATEGORY_KEYS:
         for existing_name in data_store["global_items"][cat]["items"].keys():
             if normalize_item_name(existing_name) == target:
                 return True
@@ -182,7 +205,7 @@ def item_exists_globally(item_name: str) -> bool:
 
 def find_global_item(item_name: str):
     target = normalize_item_name(item_name)
-    for cat in ["main", "other"]:
+    for cat in CATEGORY_KEYS:
         for existing_name, item_data in data_store["global_items"][cat]["items"].items():
             if normalize_item_name(existing_name) == target:
                 return cat, existing_name, item_data
@@ -211,6 +234,43 @@ def split_bulk_item_input(text: str):
     return cleaned
 
 
+def get_sorted_items_for_category(event: dict, category_key: str):
+    return sorted(
+        event["categories"][category_key]["items"].items(),
+        key=lambda x: x[0].lower()
+    )
+
+
+def get_page_count(event: dict, category_key: str) -> int:
+    total = len(event["categories"][category_key]["items"])
+    return max(1, math.ceil(total / ITEMS_PER_PAGE))
+
+
+def clamp_page(event: dict):
+    category = event["ui_state"].get("category", "equipment")
+    if category not in CATEGORY_KEYS:
+        category = "equipment"
+        event["ui_state"]["category"] = category
+
+    max_pages = get_page_count(event, category)
+    page = event["ui_state"].get("page", 0)
+    if not isinstance(page, int):
+        page = 0
+    page = max(0, min(page, max_pages - 1))
+    event["ui_state"]["page"] = page
+
+
+def get_current_page_items(event: dict):
+    clamp_page(event)
+    category = event["ui_state"]["category"]
+    page = event["ui_state"]["page"]
+
+    all_items = get_sorted_items_for_category(event, category)
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    return category, page, all_items[start:end]
+
+
 def auto_assign_leftovers(event: dict):
     players = event["priority_order"]
 
@@ -236,25 +296,20 @@ def auto_assign_leftovers(event: dict):
 
 def build_category_text(event: dict, category_key: str) -> str:
     items = event["categories"][category_key]["items"]
-    blocks = []
+    if not items:
+        return f"No {CATEGORY_MAP[category_key].lower()} items yet."
 
-    for item_name in sorted(items.keys(), key=str.lower):
-        item_data = items[item_name]
+    all_items = sorted(items.items(), key=lambda x: x[0].lower())
+    lines = []
+    for item_name, item_data in all_items[:20]:
         count = len(item_data["selections"])
         cap = item_data["capacity"]
-        users = [f"<@{x['user_id']}>" for x in item_data["selections"]]
+        lines.append(f"• **{item_name}** `{count}/{cap}`")
 
-        if users:
-            display_users = ", ".join(users[:6])
-            if len(users) > 6:
-                display_users += f" +{len(users) - 6} more"
-        else:
-            display_users = "—"
+    if len(all_items) > 20:
+        lines.append(f"...and {len(all_items) - 20} more")
 
-        blocks.append(f"**{item_name}** `{count}/{cap}`\n{display_users}")
-
-    text = "\n\n".join(blocks)
-    return text[:1024] if text else "No items yet."
+    return "\n".join(lines)[:1024]
 
 
 def build_priority_preview(event: dict) -> str:
@@ -271,30 +326,59 @@ def build_priority_preview(event: dict) -> str:
     return "\n".join(lines)[:1024]
 
 
+def build_current_page_details(event: dict) -> str:
+    clamp_page(event)
+    category, page, page_items = get_current_page_items(event)
+    page_count = get_page_count(event, category)
+
+    if not page_items:
+        return f"**{CATEGORY_MAP[category]}** — Page **{page + 1}/{page_count}**\nNo items on this page."
+
+    blocks = [f"**{CATEGORY_MAP[category]}** — Page **{page + 1}/{page_count}**", ""]
+    for item_name, item_data in page_items:
+        count = len(item_data["selections"])
+        cap = item_data["capacity"]
+        users = [f"<@{x['user_id']}>" for x in item_data["selections"]]
+
+        if users:
+            display_users = ", ".join(users[:6])
+            if len(users) > 6:
+                display_users += f" +{len(users) - 6} more"
+        else:
+            display_users = "—"
+
+        blocks.append(f"**{item_name}** `{count}/{cap}`")
+        blocks.append(display_users)
+        blocks.append("")
+
+    text = "\n".join(blocks).strip()
+    return text[:4096]
+
+
 def build_embed(event: dict) -> discord.Embed:
+    clamp_page(event)
+    active_category = event["ui_state"]["category"]
+
     embed = discord.Embed(
         title=f"🎁 {event['name']}",
         description=(
             "Select items below.\n"
             "Max per player: **Unlimited**\n"
-            f"Status: **{'Locked' if event['is_locked'] else 'Open'}**"
+            f"Status: **{'Locked' if event['is_locked'] else 'Open'}**\n"
+            f"Active Category: **{CATEGORY_MAP[active_category]}**"
         ),
         color=discord.Color.blurple()
     )
 
+    embed.add_field(name="Equipment", value=build_category_text(event, "equipment"), inline=False)
+    embed.add_field(name="Material", value=build_category_text(event, "material"), inline=False)
+    embed.add_field(name="Consumable", value=build_category_text(event, "consumable"), inline=False)
+    embed.add_field(name="Currency", value=build_category_text(event, "currency"), inline=False)
+    embed.add_field(name="Priority Order", value=build_priority_preview(event), inline=False)
+
     embed.add_field(
-        name="Main Items",
-        value=build_category_text(event, "main"),
-        inline=False
-    )
-    embed.add_field(
-        name="Other Items",
-        value=build_category_text(event, "other"),
-        inline=False
-    )
-    embed.add_field(
-        name="Priority Order",
-        value=build_priority_preview(event),
+        name="Current Page Details",
+        value=build_current_page_details(event),
         inline=False
     )
 
@@ -306,6 +390,8 @@ def is_admin(interaction: discord.Interaction) -> bool:
 
 
 async def refresh_panel_by_event(event: dict):
+    clamp_page(event)
+
     channel_id = event.get("panel_channel_id")
     message_id = event.get("panel_message_id")
 
@@ -333,32 +419,30 @@ async def refresh_panel_by_event(event: dict):
 # PLAYER UI
 # =========================
 class ItemSelect(discord.ui.Select):
-    def __init__(self, ev_key: str, category_key: str):
+    def __init__(self, ev_key: str):
         self.ev_key = ev_key
-        self.category_key = category_key
-
         event = data_store["events"][ev_key]
-        items = event["categories"][category_key]["items"]
+
+        category, _, page_items = get_current_page_items(event)
 
         options = [
             discord.SelectOption(
                 label=item_name[:100],
-                value=item_name,
+                value=f"{category}|{item_name}",
                 description=f"{len(item_data['selections'])}/{item_data['capacity']} reserved"
             )
-            for item_name, item_data in sorted(items.items(), key=lambda x: x[0].lower())
+            for item_name, item_data in page_items
         ]
 
-        placeholder = "Choose a main item" if category_key == "main" else "Choose an other item"
-
         super().__init__(
-            custom_id=f"pick:{ev_key}:{category_key}",
-            placeholder=placeholder,
-            options=options[:25] if options else [
+            custom_id=f"pick:{ev_key}",
+            placeholder=f"Choose from {CATEGORY_MAP[category]} page",
+            options=options if options else [
                 discord.SelectOption(label="No items available", value="__none__")
             ],
             min_values=1,
-            max_values=1
+            max_values=1,
+            row=0
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -372,8 +456,8 @@ class ItemSelect(discord.ui.Select):
             await interaction.response.send_message("❌ This panel is locked.", ephemeral=True)
             return
 
-        selected_name = self.values[0]
-        item = event["categories"][self.category_key]["items"][selected_name]
+        category_key, selected_name = self.values[0].split("|", 1)
+        item = event["categories"][category_key]["items"][selected_name]
 
         if interaction.user.id in [x["user_id"] for x in item["selections"]]:
             await interaction.response.send_message("You already selected this item.", ephemeral=True)
@@ -406,13 +490,13 @@ class RemoveSelect(discord.ui.Select):
         event = data_store["events"][ev_key]
 
         options = []
-        for cat in ["main", "other"]:
+        for cat in CATEGORY_KEYS:
             for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
                 options.append(
                     discord.SelectOption(
                         label=item_name[:100],
                         value=f"{cat}|{item_name}",
-                        description=f"{len(item_data['selections'])}/{item_data['capacity']} reserved"
+                        description=f"{CATEGORY_MAP[cat]} • {len(item_data['selections'])}/{item_data['capacity']}"
                     )
                 )
 
@@ -423,7 +507,8 @@ class RemoveSelect(discord.ui.Select):
                 discord.SelectOption(label="No items available", value="__none__")
             ],
             min_values=1,
-            max_values=1
+            max_values=1,
+            row=3
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -453,6 +538,97 @@ class RemoveSelect(discord.ui.Select):
 
 
 # =========================
+# CATEGORY / PAGE CONTROLS
+# =========================
+class CategoryButton(discord.ui.Button):
+    def __init__(self, ev_key: str, category_key: str):
+        event = data_store["events"][ev_key]
+        active = event["ui_state"].get("category") == category_key
+
+        super().__init__(
+            label=CATEGORY_MAP[category_key],
+            style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
+            custom_id=f"cat:{ev_key}:{category_key}",
+            row=1
+        )
+        self.ev_key = ev_key
+        self.category_key = category_key
+
+    async def callback(self, interaction: discord.Interaction):
+        event = data_store["events"][self.ev_key]
+        event["ui_state"]["category"] = self.category_key
+        event["ui_state"]["page"] = 0
+
+        await save_data()
+        await interaction.response.edit_message(
+            embed=build_embed(event),
+            view=PanelView(self.ev_key)
+        )
+
+
+class PrevPageButton(discord.ui.Button):
+    def __init__(self, ev_key: str):
+        super().__init__(
+            label="⬅️ Prev",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"prev:{ev_key}",
+            row=2
+        )
+        self.ev_key = ev_key
+
+    async def callback(self, interaction: discord.Interaction):
+        event = data_store["events"][self.ev_key]
+        clamp_page(event)
+        event["ui_state"]["page"] = max(0, event["ui_state"]["page"] - 1)
+
+        await save_data()
+        await interaction.response.edit_message(
+            embed=build_embed(event),
+            view=PanelView(self.ev_key)
+        )
+
+
+class PageInfoButton(discord.ui.Button):
+    def __init__(self, ev_key: str):
+        event = data_store["events"][ev_key]
+        clamp_page(event)
+        category = event["ui_state"]["category"]
+        page = event["ui_state"]["page"]
+        total_pages = get_page_count(event, category)
+
+        super().__init__(
+            label=f"Page {page + 1}/{total_pages}",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"pageinfo:{ev_key}",
+            disabled=True,
+            row=2
+        )
+
+
+class NextPageButton(discord.ui.Button):
+    def __init__(self, ev_key: str):
+        super().__init__(
+            label="Next ➡️",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"next:{ev_key}",
+            row=2
+        )
+        self.ev_key = ev_key
+
+    async def callback(self, interaction: discord.Interaction):
+        event = data_store["events"][self.ev_key]
+        clamp_page(event)
+        max_pages = get_page_count(event, event["ui_state"]["category"])
+        event["ui_state"]["page"] = min(max_pages - 1, event["ui_state"]["page"] + 1)
+
+        await save_data()
+        await interaction.response.edit_message(
+            embed=build_embed(event),
+            view=PanelView(self.ev_key)
+        )
+
+
+# =========================
 # ADMIN UI
 # =========================
 class EditCapItemSelect(discord.ui.Select):
@@ -461,13 +637,13 @@ class EditCapItemSelect(discord.ui.Select):
         event = data_store["events"][ev_key]
 
         options = []
-        for cat in ["main", "other"]:
+        for cat in CATEGORY_KEYS:
             for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
                 options.append(
                     discord.SelectOption(
                         label=item_name[:100],
                         value=f"{cat}|{item_name}",
-                        description=f"Current cap: {item_data['capacity']}"
+                        description=f"{CATEGORY_MAP[cat]} • Current cap: {item_data['capacity']}"
                     )
                 )
 
@@ -525,7 +701,12 @@ class EditCapModal(discord.ui.Modal, title="Set New Cap"):
 
 class EditCapButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(label="✏️ Edit Cap", style=discord.ButtonStyle.primary, custom_id=f"editcap:{ev_key}")
+        super().__init__(
+            label="✏️ Edit Cap",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"editcap:{ev_key}",
+            row=4
+        )
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -546,7 +727,8 @@ class SearchItemSelect(discord.ui.Select):
         options = [
             discord.SelectOption(
                 label=name[:100],
-                value=f"{cat}|{name}"
+                value=f"{cat}|{name}",
+                description=CATEGORY_MAP[cat]
             )
             for cat, name in results[:25]
         ]
@@ -605,7 +787,7 @@ class SearchItemModal(discord.ui.Modal, title="Search Global Item"):
         q = normalize_item_name(self.query.value)
         results = []
 
-        for cat in ["main", "other"]:
+        for cat in CATEGORY_KEYS:
             for item_name in sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower):
                 if q in normalize_item_name(item_name):
                     results.append((cat, item_name))
@@ -617,27 +799,6 @@ class SearchItemModal(discord.ui.Modal, title="Search Global Item"):
         view = discord.ui.View()
         view.add_item(SearchItemSelect(self.ev_key, cap, results))
         await interaction.response.send_message("Select search result:", view=view, ephemeral=True)
-
-
-class SearchItemButton(discord.ui.Button):
-    def __init__(self, ev_key: str):
-        super().__init__(label="🔍 Search Item", style=discord.ButtonStyle.secondary, custom_id=f"searchitem:{ev_key}")
-        self.ev_key = ev_key
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-            return
-
-        has_global_items = any(
-            data_store["global_items"][cat]["items"]
-            for cat in ["main", "other"]
-        )
-        if not has_global_items:
-            await interaction.response.send_message("❌ No global items available yet.", ephemeral=True)
-            return
-
-        await interaction.response.send_modal(SearchItemModal(self.ev_key))
 
 
 class BulkAddTextModal(discord.ui.Modal, title="Bulk Add by Text"):
@@ -727,27 +888,6 @@ class BulkAddTextModal(discord.ui.Modal, title="Bulk Add by Text"):
         await interaction.response.send_message(message, ephemeral=True)
 
 
-class BulkAddTextButton(discord.ui.Button):
-    def __init__(self, ev_key: str):
-        super().__init__(label="📝 Bulk Add by Text", style=discord.ButtonStyle.success, custom_id=f"bulktext:{ev_key}")
-        self.ev_key = ev_key
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-            return
-
-        has_global_items = any(
-            data_store["global_items"][cat]["items"]
-            for cat in ["main", "other"]
-        )
-        if not has_global_items:
-            await interaction.response.send_message("❌ No global items available yet.", ephemeral=True)
-            return
-
-        await interaction.response.send_modal(BulkAddTextModal(self.ev_key))
-
-
 class AddItemModeView(discord.ui.View):
     def __init__(self, ev_key: str):
         super().__init__(timeout=300)
@@ -761,7 +901,7 @@ class AddItemModeView(discord.ui.View):
 
         has_global_items = any(
             data_store["global_items"][cat]["items"]
-            for cat in ["main", "other"]
+            for cat in CATEGORY_KEYS
         )
         if not has_global_items:
             await interaction.response.send_message("❌ No global items available yet.", ephemeral=True)
@@ -777,7 +917,7 @@ class AddItemModeView(discord.ui.View):
 
         has_global_items = any(
             data_store["global_items"][cat]["items"]
-            for cat in ["main", "other"]
+            for cat in CATEGORY_KEYS
         )
         if not has_global_items:
             await interaction.response.send_message("❌ No global items available yet.", ephemeral=True)
@@ -788,7 +928,12 @@ class AddItemModeView(discord.ui.View):
 
 class AddItemButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(label="➕ Add Item", style=discord.ButtonStyle.success, custom_id=f"additem:{ev_key}")
+        super().__init__(
+            label="➕ Add Item",
+            style=discord.ButtonStyle.success,
+            custom_id=f"additem:{ev_key}",
+            row=4
+        )
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -798,7 +943,7 @@ class AddItemButton(discord.ui.Button):
 
         has_global_items = any(
             data_store["global_items"][cat]["items"]
-            for cat in ["main", "other"]
+            for cat in CATEGORY_KEYS
         )
         if not has_global_items:
             await interaction.response.send_message("❌ No global items available yet.", ephemeral=True)
@@ -817,13 +962,13 @@ class RemoveItemFromPanelSelect(discord.ui.Select):
         event = data_store["events"][ev_key]
 
         options = []
-        for cat in ["main", "other"]:
+        for cat in CATEGORY_KEYS:
             for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
                 options.append(
                     discord.SelectOption(
                         label=item_name[:100],
                         value=f"{cat}|{item_name}",
-                        description=f"{len(item_data['selections'])}/{item_data['capacity']} reserved"
+                        description=f"{CATEGORY_MAP[cat]} • {len(item_data['selections'])}/{item_data['capacity']}"
                     )
                 )
 
@@ -850,6 +995,8 @@ class RemoveItemFromPanelSelect(discord.ui.Select):
 
         del event["categories"][cat]["items"][item_name]
 
+        clamp_page(event)
+
         await save_data()
         await refresh_panel_by_event(event)
         await interaction.response.send_message(
@@ -860,7 +1007,12 @@ class RemoveItemFromPanelSelect(discord.ui.Select):
 
 class RemoveItemButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(label="🗑️ Remove Item", style=discord.ButtonStyle.danger, custom_id=f"removeitem:{ev_key}")
+        super().__init__(
+            label="🗑️ Remove Item",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"removeitem:{ev_key}",
+            row=4
+        )
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -894,7 +1046,12 @@ class AddPriorityUserSelect(discord.ui.UserSelect):
 
 class AddPriorityButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(label="👑 Add Priority", style=discord.ButtonStyle.primary, custom_id=f"addpriority:{ev_key}")
+        super().__init__(
+            label="👑 Add Priority",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"addpriority:{ev_key}",
+            row=4
+        )
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -946,7 +1103,12 @@ class RemovePrioritySelect(discord.ui.Select):
 
 class RemovePriorityButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(label="➖ Remove Priority", style=discord.ButtonStyle.danger, custom_id=f"removepriority:{ev_key}")
+        super().__init__(
+            label="➖ Remove Priority",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"removepriority:{ev_key}",
+            row=4
+        )
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -962,9 +1124,20 @@ class RemovePriorityButton(discord.ui.Button):
 class PanelView(discord.ui.View):
     def __init__(self, ev_key: str):
         super().__init__(timeout=None)
-        self.add_item(ItemSelect(ev_key, "main"))
-        self.add_item(ItemSelect(ev_key, "other"))
+
+        self.add_item(ItemSelect(ev_key))
+
+        self.add_item(CategoryButton(ev_key, "equipment"))
+        self.add_item(CategoryButton(ev_key, "material"))
+        self.add_item(CategoryButton(ev_key, "consumable"))
+        self.add_item(CategoryButton(ev_key, "currency"))
+
+        self.add_item(PrevPageButton(ev_key))
+        self.add_item(PageInfoButton(ev_key))
+        self.add_item(NextPageButton(ev_key))
+
         self.add_item(RemoveSelect(ev_key))
+
         self.add_item(AddItemButton(ev_key))
         self.add_item(EditCapButton(ev_key))
         self.add_item(RemoveItemButton(ev_key))
@@ -1067,7 +1240,7 @@ async def remove_global_item(
 ):
     await interaction.response.defer(ephemeral=True)
 
-    for cat in ["main", "other"]:
+    for cat in CATEGORY_KEYS:
         for existing_name in list(data_store["global_items"][cat]["items"].keys()):
             if normalize_item_name(existing_name) == normalize_item_name(item_name):
                 del data_store["global_items"][cat]["items"][existing_name]
@@ -1114,27 +1287,28 @@ async def add_global_items_bulk(
 
     parts = []
     if added:
-        parts.append(f"✅ Added to global **{category.name}** with cap **{cap}**:\n" + ", ".join(added))
+        parts.append(f"✅ Added to global **{category.name}** with cap **{cap}**:\n" + "\n".join(f"• {x}" for x in added[:50]))
+        if len(added) > 50:
+            parts.append(f"…and {len(added) - 50} more added.")
     if skipped:
-        parts.append("⚠️ Skipped duplicates:\n" + ", ".join(skipped))
+        parts.append("⚠️ Skipped duplicates:\n" + "\n".join(f"• {x}" for x in skipped[:50]))
+        if len(skipped) > 50:
+            parts.append(f"…and {len(skipped) - 50} more skipped.")
 
     await interaction.followup.send("\n\n".join(parts), ephemeral=True)
 
 
 @bot.tree.command(name="show_items", description="Show all global library items")
 async def show_items(interaction: discord.Interaction):
-    main_items = sorted(data_store["global_items"]["main"]["items"].keys(), key=str.lower)
-    other_items = sorted(data_store["global_items"]["other"]["items"].keys(), key=str.lower)
-
-    main_text = "\n".join(f"• {x}" for x in main_items[:50]) if main_items else "None"
-    other_text = "\n".join(f"• {x}" for x in other_items[:50]) if other_items else "None"
-
     embed = discord.Embed(
         title="Global Item Library",
         color=discord.Color.green()
     )
-    embed.add_field(name="Main Items", value=main_text[:1024], inline=False)
-    embed.add_field(name="Other Items", value=other_text[:1024], inline=False)
+
+    for cat in CATEGORY_KEYS:
+        items = sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower)
+        text = "\n".join(f"• {x}" for x in items[:50]) if items else "None"
+        embed.add_field(name=CATEGORY_MAP[cat], value=text[:1024], inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1153,11 +1327,11 @@ async def lock_event(
     ev["is_locked"] = True
 
     winners = [f"🏆 **Winners — {ev['name']}**", ""]
-    for cat in ["main", "other"]:
+    for cat in CATEGORY_KEYS:
         for item_name, item_data in sorted(ev["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
             if item_data["selections"]:
                 users = ", ".join([f"<@{x['user_id']}>" for x in item_data["selections"]])
-                winners.append(f"**{item_name}**: {users}")
+                winners.append(f"**[{CATEGORY_MAP[cat]}] {item_name}**: {users}")
 
     await save_data()
     await refresh_panel_by_event(ev)
