@@ -271,6 +271,15 @@ def get_current_page_items(event: dict):
     return category, page, all_items[start:end]
 
 
+def get_user_selected_items(event: dict, user_id: int):
+    results = []
+    for cat in CATEGORY_KEYS:
+        for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
+            if any(x["user_id"] == user_id for x in item_data["selections"]):
+                results.append((cat, item_name, item_data))
+    return results
+
+
 def auto_assign_leftovers(event: dict):
     players = event["priority_order"]
 
@@ -484,36 +493,56 @@ class ItemSelect(discord.ui.Select):
         await interaction.response.send_message(f"✅ You selected **{selected_name}**.", ephemeral=True)
 
 
-class RemoveSelect(discord.ui.Select):
-    def __init__(self, ev_key: str):
+# =========================
+# REMOVE MY ITEM UI
+# =========================
+class RemoveMyItemSelect(discord.ui.Select):
+    def __init__(self, ev_key: str, user_id: int, page: int = 0, query: str | None = None):
         self.ev_key = ev_key
-        event = data_store["events"][ev_key]
+        self.user_id = user_id
+        self.page = page
+        self.query = query or ""
 
-        options = []
-        for cat in CATEGORY_KEYS:
-            for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
-                options.append(
-                    discord.SelectOption(
-                        label=item_name[:100],
-                        value=f"{cat}|{item_name}",
-                        description=f"{CATEGORY_MAP[cat]} • {len(item_data['selections'])}/{item_data['capacity']}"
-                    )
-                )
+        event = data_store["events"][ev_key]
+        items = get_user_selected_items(event, user_id)
+
+        if self.query:
+            q = normalize_item_name(self.query)
+            items = [
+                (cat, item_name, item_data)
+                for cat, item_name, item_data in items
+                if q in normalize_item_name(item_name)
+            ]
+
+        self.filtered_items = items
+        self.total_pages = max(1, math.ceil(len(items) / ITEMS_PER_PAGE))
+        self.page = max(0, min(self.page, self.total_pages - 1))
+
+        start = self.page * ITEMS_PER_PAGE
+        end = start + ITEMS_PER_PAGE
+        page_items = items[start:end]
+
+        options = [
+            discord.SelectOption(
+                label=item_name[:100],
+                value=f"{cat}|{item_name}",
+                description=f"{CATEGORY_MAP[cat]} • {len(item_data['selections'])}/{item_data['capacity']}"
+            )
+            for cat, item_name, item_data in page_items
+        ]
 
         super().__init__(
-            custom_id=f"remove:{ev_key}",
-            placeholder="Remove one of your selected items",
-            options=options[:25] if options else [
-                discord.SelectOption(label="No items available", value="__none__")
+            placeholder=f"Your selected items • Page {self.page + 1}/{self.total_pages}",
+            options=options if options else [
+                discord.SelectOption(label="No matching selected items", value="__none__")
             ],
             min_values=1,
-            max_values=1,
-            row=3
+            max_values=1
         )
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "__none__":
-            await interaction.response.send_message("No items available.", ephemeral=True)
+            await interaction.response.send_message("No removable item found.", ephemeral=True)
             return
 
         event = data_store["events"][self.ev_key]
@@ -534,7 +563,153 @@ class RemoveSelect(discord.ui.Select):
 
         await save_data()
         await refresh_panel_by_event(event)
-        await interaction.response.send_message(f"🗑️ Removed **{item_name}**.", ephemeral=True)
+
+        new_view = RemoveMyItemView(self.ev_key, interaction.user.id, page=self.page, query=self.query)
+        content = f"🗑️ Removed **{item_name}**."
+        if interaction.response.is_done():
+            await interaction.followup.edit_message(
+                interaction.message.id,
+                content=content,
+                view=new_view
+            )
+        else:
+            await interaction.response.edit_message(
+                content=content,
+                view=new_view
+            )
+
+
+class RemoveMyItemSearchModal(discord.ui.Modal, title="Search My Selected Items"):
+    query = discord.ui.TextInput(label="Search item name", required=True, max_length=100)
+
+    def __init__(self, ev_key: str, user_id: int):
+        super().__init__()
+        self.ev_key = ev_key
+        self.user_id = user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = RemoveMyItemView(self.ev_key, self.user_id, page=0, query=self.query.value)
+        await interaction.response.send_message(
+            f"Search results for: **{self.query.value}**",
+            view=view,
+            ephemeral=True
+        )
+
+
+class RemoveMyItemPrevButton(discord.ui.Button):
+    def __init__(self, ev_key: str, user_id: int, page: int, query: str | None):
+        super().__init__(label="⬅️ Prev", style=discord.ButtonStyle.secondary)
+        self.ev_key = ev_key
+        self.user_id = user_id
+        self.page = page
+        self.query = query or ""
+
+    async def callback(self, interaction: discord.Interaction):
+        new_view = RemoveMyItemView(self.ev_key, self.user_id, page=max(0, self.page - 1), query=self.query)
+        await interaction.response.edit_message(view=new_view)
+
+
+class RemoveMyItemPageInfoButton(discord.ui.Button):
+    def __init__(self, total_pages: int, page: int):
+        super().__init__(
+            label=f"Page {page + 1}/{total_pages}",
+            style=discord.ButtonStyle.primary,
+            disabled=True
+        )
+
+
+class RemoveMyItemNextButton(discord.ui.Button):
+    def __init__(self, ev_key: str, user_id: int, page: int, total_pages: int, query: str | None):
+        super().__init__(label="Next ➡️", style=discord.ButtonStyle.secondary)
+        self.ev_key = ev_key
+        self.user_id = user_id
+        self.page = page
+        self.total_pages = total_pages
+        self.query = query or ""
+
+    async def callback(self, interaction: discord.Interaction):
+        new_view = RemoveMyItemView(
+            self.ev_key,
+            self.user_id,
+            page=min(self.total_pages - 1, self.page + 1),
+            query=self.query
+        )
+        await interaction.response.edit_message(view=new_view)
+
+
+class RemoveMyItemSearchButton(discord.ui.Button):
+    def __init__(self, ev_key: str, user_id: int):
+        super().__init__(label="🔍 Search My Items", style=discord.ButtonStyle.secondary)
+        self.ev_key = ev_key
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(RemoveMyItemSearchModal(self.ev_key, self.user_id))
+
+
+class ClearRemoveMyItemSearchButton(discord.ui.Button):
+    def __init__(self, ev_key: str, user_id: int):
+        super().__init__(label="♻️ Clear Search", style=discord.ButtonStyle.secondary)
+        self.ev_key = ev_key
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        new_view = RemoveMyItemView(self.ev_key, self.user_id, page=0, query="")
+        await interaction.response.edit_message(content="Your selected items:", view=new_view)
+
+
+class RemoveMyItemView(discord.ui.View):
+    def __init__(self, ev_key: str, user_id: int, page: int = 0, query: str | None = None):
+        super().__init__(timeout=300)
+        self.ev_key = ev_key
+        self.user_id = user_id
+        self.page = page
+        self.query = query or ""
+
+        select = RemoveMyItemSelect(ev_key, user_id, page=page, query=self.query)
+        self.page = select.page
+        total_pages = select.total_pages
+
+        self.add_item(select)
+        self.add_item(RemoveMyItemPrevButton(ev_key, user_id, self.page, self.query))
+        self.add_item(RemoveMyItemPageInfoButton(total_pages, self.page))
+        self.add_item(RemoveMyItemNextButton(ev_key, user_id, self.page, total_pages, self.query))
+        self.add_item(RemoveMyItemSearchButton(ev_key, user_id))
+
+        if self.query:
+            self.add_item(ClearRemoveMyItemSearchButton(ev_key, user_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This remover is only for the user who opened it.", ephemeral=True)
+            return False
+        return True
+
+
+class RemoveMyItemButton(discord.ui.Button):
+    def __init__(self, ev_key: str):
+        super().__init__(
+            label="🗑️ Remove My Item",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"removemyitem:{ev_key}",
+            row=3
+        )
+        self.ev_key = ev_key
+
+    async def callback(self, interaction: discord.Interaction):
+        event = data_store["events"][self.ev_key]
+
+        if event["is_locked"]:
+            await interaction.response.send_message("❌ This panel is locked.", ephemeral=True)
+            return
+
+        selected = get_user_selected_items(event, interaction.user.id)
+        if not selected:
+            await interaction.response.send_message("You have no selected items to remove.", ephemeral=True)
+            return
+
+        view = RemoveMyItemView(self.ev_key, interaction.user.id)
+        await interaction.response.send_message("Your selected items:", view=view, ephemeral=True)
 
 
 # =========================
@@ -1136,7 +1311,7 @@ class PanelView(discord.ui.View):
         self.add_item(PageInfoButton(ev_key))
         self.add_item(NextPageButton(ev_key))
 
-        self.add_item(RemoveSelect(ev_key))
+        self.add_item(RemoveMyItemButton(ev_key))
 
         self.add_item(AddItemButton(ev_key))
         self.add_item(EditCapButton(ev_key))
