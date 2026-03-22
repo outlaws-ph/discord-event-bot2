@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import asyncpg
+import asyncpg  # ✅ FIXED (correct import)
 import os
 import json
 from datetime import datetime, timezone
@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-MAX_ITEMS_PER_PLAYER = 2  # 🔥 LIMIT PER PLAYER
+MAX_ITEMS_PER_PLAYER = 2  # 🔥 you can change this anytime
 
 intents = discord.Intents.default()
 intents.members = True
@@ -126,7 +126,7 @@ def build_embed(event):
     return embed
 
 # =========================
-# SELECT
+# SELECT UI
 # =========================
 class Select(discord.ui.Select):
     def __init__(self, event_key, cat_key):
@@ -147,12 +147,12 @@ class Select(discord.ui.Select):
         event = data_store["events"][self.event_key]
 
         if event["is_locked"]:
-            await interaction.response.send_message("Panel is locked", ephemeral=True)
+            await interaction.response.send_message("❌ Panel is locked", ephemeral=True)
             return
 
         if count_user_items(event, interaction.user.id) >= MAX_ITEMS_PER_PLAYER:
             await interaction.response.send_message(
-                f"You can only select {MAX_ITEMS_PER_PLAYER} items.",
+                f"❌ Max {MAX_ITEMS_PER_PLAYER} items only.",
                 ephemeral=True
             )
             return
@@ -178,7 +178,7 @@ class Select(discord.ui.Select):
 
         await save_data()
         await interaction.message.edit(embed=build_embed(event))
-        await interaction.response.send_message("Selected!", ephemeral=True)
+        await interaction.response.send_message("✅ Selected!", ephemeral=True)
 
 # =========================
 # VIEW
@@ -197,18 +197,22 @@ class View(discord.ui.View):
 async def create_event(interaction, name: str):
     ensure_event(name)
     await save_data()
-    await interaction.response.send_message(f"Event **{name}** created")
+    await interaction.response.send_message(f"✅ Event **{name}** created")
 
 @bot.tree.command(name="create_panel")
 async def create_panel(interaction, name: str):
     event = ensure_event(name)
 
-    msg = await interaction.channel.send(embed=build_embed(event), view=View(name.lower()))
+    msg = await interaction.channel.send(
+        embed=build_embed(event),
+        view=View(name.lower())
+    )
+
     event["panel_channel_id"] = interaction.channel.id
     event["panel_message_id"] = msg.id
 
     await save_data()
-    await interaction.response.send_message("Panel created", ephemeral=True)
+    await interaction.response.send_message("✅ Panel created", ephemeral=True)
 
 @bot.tree.command(name="add_item")
 async def add_item(interaction, name: str, category: str, item: str, cap: int):
@@ -220,7 +224,7 @@ async def add_item(interaction, name: str, category: str, item: str, cap: int):
     }
 
     await save_data()
-    await interaction.response.send_message("Item added", ephemeral=True)
+    await interaction.response.send_message("✅ Item added", ephemeral=True)
 
 @bot.tree.command(name="add_priority")
 async def add_priority(interaction, name: str, user: discord.Member):
@@ -228,7 +232,7 @@ async def add_priority(interaction, name: str, user: discord.Member):
     event["priority_order"].append(user.id)
 
     await save_data()
-    await interaction.response.send_message("Priority added", ephemeral=True)
+    await interaction.response.send_message("✅ Priority added", ephemeral=True)
 
 @bot.tree.command(name="lock_event")
 async def lock_event(interaction, name: str):
