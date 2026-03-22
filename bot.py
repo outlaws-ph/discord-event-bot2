@@ -1,5 +1,6 @@
 import os
 import json
+import copy
 from datetime import datetime, timezone
 
 import asyncpg
@@ -22,12 +23,35 @@ PRESET_EVENTS = [
     "Guild Dungeon",
 ]
 
+PRESET_EVENT_CHOICES = [
+    app_commands.Choice(name=name, value=name) for name in PRESET_EVENTS
+]
+
+CATEGORY_CHOICES = [
+    app_commands.Choice(name="Main Items", value="main"),
+    app_commands.Choice(name="Other Items", value="other"),
+]
+
+DEFAULT_GLOBAL_ITEMS = {
+    "main": {
+        "label": "Main Items",
+        "items": {}
+    },
+    "other": {
+        "label": "Other Items",
+        "items": {}
+    }
+}
+
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool = None
-data_store = {"events": {}}
+data_store = {
+    "global_items": copy.deepcopy(DEFAULT_GLOBAL_ITEMS),
+    "events": {}
+}
 
 
 # =========================
@@ -36,6 +60,17 @@ data_store = {"events": {}}
 def ensure_data_defaults(data: dict) -> dict:
     if not isinstance(data, dict):
         data = {}
+
+    if "global_items" not in data or not isinstance(data["global_items"], dict):
+        data["global_items"] = copy.deepcopy(DEFAULT_GLOBAL_ITEMS)
+
+    for key in ["main", "other"]:
+        if key not in data["global_items"] or not isinstance(data["global_items"][key], dict):
+            data["global_items"][key] = copy.deepcopy(DEFAULT_GLOBAL_ITEMS[key])
+        if "label" not in data["global_items"][key]:
+            data["global_items"][key]["label"] = DEFAULT_GLOBAL_ITEMS[key]["label"]
+        if "items" not in data["global_items"][key] or not isinstance(data["global_items"][key]["items"], dict):
+            data["global_items"][key]["items"] = {}
 
     if "events" not in data or not isinstance(data["events"], dict):
         data["events"] = {}
@@ -67,6 +102,7 @@ async def init_db():
 
 async def load_data():
     global data_store
+
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT json FROM data WHERE id = 1")
 
@@ -78,6 +114,7 @@ async def load_data():
             raw = {}
 
     data_store = ensure_data_defaults(raw)
+    migrate_events_to_global_items()
     await save_data()
 
 
@@ -85,7 +122,7 @@ async def save_data():
     async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE data SET json = $1 WHERE id = 1",
-            json.dumps(data_store)
+            json.dumps(data_store, ensure_ascii=False)
         )
 
 
@@ -96,29 +133,46 @@ def now_ts() -> float:
     return datetime.now(timezone.utc).timestamp()
 
 
-def make_event_key(name: str) -> str:
-    return name.strip().lower()
+def make_key(text: str) -> str:
+    return text.strip().lower()
 
 
-def ensure_event(name: str):
-    key = make_event_key(name)
-    if key not in data_store["events"]:
-        data_store["events"][key] = {
-            "name": name,
+def normalize_item_name(name: str) -> str:
+    return " ".join(name.strip().split()).casefold()
+
+
+def make_event_display_name(base_event: str, run_date: str) -> str:
+    return f"{base_event} {run_date.strip()}"
+
+
+def make_event_key(base_event: str, run_date: str) -> str:
+    return make_key(make_event_display_name(base_event, run_date))
+
+
+def clone_categories_from_global():
+    return copy.deepcopy(data_store["global_items"])
+
+
+def ensure_event(base_event: str, run_date: str):
+    ev_key = make_event_key(base_event, run_date)
+
+    if ev_key not in data_store["events"]:
+        data_store["events"][ev_key] = {
+            "base_event": base_event,
+            "run_date": run_date.strip(),
+            "name": make_event_display_name(base_event, run_date),
             "priority_order": [],
             "is_locked": False,
             "panel_channel_id": None,
             "panel_message_id": None,
-            "categories": {
-                "main": {"label": "Main Items", "items": {}},
-                "other": {"label": "Other Items", "items": {}}
-            }
+            "categories": clone_categories_from_global()
         }
-    return data_store["events"][key]
+
+    return data_store["events"][ev_key]
 
 
-def get_event(name: str):
-    return data_store["events"].get(make_event_key(name))
+def get_event(base_event: str, run_date: str):
+    return data_store["events"].get(make_event_key(base_event, run_date))
 
 
 def count_user_items(event: dict, user_id: int) -> int:
@@ -134,6 +188,75 @@ def get_rank(event: dict, user_id: int) -> int:
         return event["priority_order"].index(user_id) + 1
     except ValueError:
         return 999999
+
+
+def item_exists_globally(item_name: str) -> bool:
+    target = normalize_item_name(item_name)
+    for cat in data_store["global_items"].values():
+        for existing_name in cat["items"].keys():
+            if normalize_item_name(existing_name) == target:
+                return True
+    return False
+
+
+def find_global_item(item_name: str):
+    target = normalize_item_name(item_name)
+    for cat_key, cat in data_store["global_items"].items():
+        for existing_name, item_data in cat["items"].items():
+            if normalize_item_name(existing_name) == target:
+                return cat_key, existing_name, item_data
+    return None, None, None
+
+
+def migrate_events_to_global_items():
+    global_items = data_store["global_items"]
+
+    # pull any existing event-only items into global list
+    for event in data_store["events"].values():
+        categories = event.get("categories", {})
+        for cat_key in ["main", "other"]:
+            cat = categories.get(cat_key, {})
+            items = cat.get("items", {})
+            for item_name, item_data in items.items():
+                if not item_exists_globally(item_name):
+                    global_items[cat_key]["items"][item_name] = {
+                        "capacity": item_data.get("capacity", 1),
+                        "selections": []
+                    }
+
+    # then make sure every event contains every global item
+    for event in data_store["events"].values():
+        sync_global_items_to_event(event)
+
+
+def sync_global_items_to_event(event: dict):
+    for cat_key in ["main", "other"]:
+        if cat_key not in event["categories"]:
+            event["categories"][cat_key] = copy.deepcopy(DEFAULT_GLOBAL_ITEMS[cat_key])
+
+        if "items" not in event["categories"][cat_key]:
+            event["categories"][cat_key]["items"] = {}
+
+        event_items = event["categories"][cat_key]["items"]
+        global_items = data_store["global_items"][cat_key]["items"]
+
+        # add missing global items to event
+        for item_name, global_item in global_items.items():
+            if item_name not in event_items:
+                event_items[item_name] = {
+                    "capacity": global_item["capacity"],
+                    "selections": []
+                }
+
+        # remove items that no longer exist globally
+        to_remove = [name for name in event_items.keys() if name not in global_items]
+        for item_name in to_remove:
+            del event_items[item_name]
+
+
+def sync_global_items_to_all_events():
+    for event in data_store["events"].values():
+        sync_global_items_to_event(event)
 
 
 def auto_assign_leftovers(event: dict):
@@ -247,10 +370,15 @@ async def refresh_panel_by_event(event: dict):
         message = await channel.fetch_message(message_id)
         await message.edit(
             embed=build_embed(event),
-            view=EventView(make_event_key(event["name"]))
+            view=EventView(make_key(event["name"]))
         )
     except Exception as e:
         print(f"Failed to refresh panel: {e}")
+
+
+async def refresh_all_event_panels():
+    for event in data_store["events"].values():
+        await refresh_panel_by_event(event)
 
 
 # =========================
@@ -392,152 +520,240 @@ class EventView(discord.ui.View):
 
 
 # =========================
-# PRESET EVENT CHOICES
-# =========================
-PRESET_EVENT_CHOICES = [
-    app_commands.Choice(name="Sindris", value="Sindris"),
-    app_commands.Choice(name="Int FV 5F", value="Int FV 5F"),
-    app_commands.Choice(name="Server Battle", value="Server Battle"),
-    app_commands.Choice(name="Canyon Depth", value="Canyon Depth"),
-    app_commands.Choice(name="Vale of Ragnarok", value="Vale of Ragnarok"),
-    app_commands.Choice(name="Crossroad of Ragnarok", value="Crossroad of Ragnarok"),
-    app_commands.Choice(name="Guild Dungeon", value="Guild Dungeon"),
-]
-
-
-# =========================
 # COMMANDS
 # =========================
-@bot.tree.command(name="create_event", description="Create a new event from preset list")
+@bot.tree.command(name="create_event", description="Create a dated event from preset list")
 @app_commands.choices(event=PRESET_EVENT_CHOICES)
-async def create_event(interaction: discord.Interaction, event: app_commands.Choice[str]):
+async def create_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
     await interaction.response.defer(ephemeral=True)
-    ensure_event(event.value)
-    await save_data()
-    await interaction.followup.send(f"✅ Event **{event.value}** created.", ephemeral=True)
 
-
-@bot.tree.command(name="create_event_custom", description="Create a custom event")
-async def create_event_custom(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True)
-    ensure_event(name)
+    ev = ensure_event(event.value, run_date)
     await save_data()
-    await interaction.followup.send(f"✅ Custom event **{name}** created.", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ Event **{ev['name']}** created.",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="create_panel", description="Create a panel from preset event list")
 @app_commands.choices(event=PRESET_EVENT_CHOICES)
-async def create_panel(interaction: discord.Interaction, event: app_commands.Choice[str]):
+async def create_panel(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
     await interaction.response.defer(ephemeral=True)
 
-    ev = ensure_event(event.value)
+    ev = ensure_event(event.value, run_date)
     msg = await interaction.channel.send(
         embed=build_embed(ev),
-        view=EventView(make_event_key(event.value))
+        view=EventView(make_key(ev["name"]))
     )
 
     ev["panel_channel_id"] = interaction.channel.id
     ev["panel_message_id"] = msg.id
 
     await save_data()
-    await interaction.followup.send(f"✅ Panel created for **{event.value}**.", ephemeral=True)
-
-
-@bot.tree.command(name="create_panel_custom", description="Create a panel for a custom event")
-async def create_panel_custom(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True)
-
-    ev = ensure_event(name)
-    msg = await interaction.channel.send(
-        embed=build_embed(ev),
-        view=EventView(make_event_key(name))
+    await interaction.followup.send(
+        f"✅ Panel created for **{ev['name']}**.",
+        ephemeral=True
     )
 
-    ev["panel_channel_id"] = interaction.channel.id
-    ev["panel_message_id"] = msg.id
 
-    await save_data()
-    await interaction.followup.send(f"✅ Panel created for **{name}**.", ephemeral=True)
-
-
-@app_commands.describe(category="Use main or other")
-@bot.tree.command(name="add_item", description="Add an item to an event")
+@bot.tree.command(name="add_item", description="Add a global item for all events")
+@app_commands.choices(category=CATEGORY_CHOICES)
 async def add_item(
     interaction: discord.Interaction,
-    name: str,
-    category: str,
-    item: str,
+    category: app_commands.Choice[str],
+    item_name: str,
     cap: app_commands.Range[int, 1, 99]
 ):
     await interaction.response.defer(ephemeral=True)
 
-    category = category.lower()
-    if category not in ["main", "other"]:
-        await interaction.followup.send("❌ Category must be `main` or `other`.", ephemeral=True)
+    if item_exists_globally(item_name):
+        await interaction.followup.send(
+            "❌ That item name already exists globally.",
+            ephemeral=True
+        )
         return
 
-    event = ensure_event(name)
-    event["categories"][category]["items"][item] = {
+    data_store["global_items"][category.value]["items"][item_name] = {
         "capacity": cap,
         "selections": []
     }
 
+    sync_global_items_to_all_events()
     await save_data()
-    await refresh_panel_by_event(event)
-    await interaction.followup.send("✅ Item added.", ephemeral=True)
+    await refresh_all_event_panels()
+
+    await interaction.followup.send(
+        f"✅ Added **{item_name}** under **{category.name}**.\n"
+        f"It is now available across all events.",
+        ephemeral=True
+    )
 
 
-@bot.tree.command(name="add_priority", description="Add a priority player to an event")
-async def add_priority(interaction: discord.Interaction, name: str, user: discord.Member):
+@bot.tree.command(name="edit_item", description="Edit a global item")
+@app_commands.choices(category=CATEGORY_CHOICES)
+async def edit_item(
+    interaction: discord.Interaction,
+    current_item_name: str,
+    new_item_name: str,
+    category: app_commands.Choice[str],
+    cap: app_commands.Range[int, 1, 99]
+):
     await interaction.response.defer(ephemeral=True)
 
-    event = ensure_event(name)
-    if user.id not in event["priority_order"]:
-        event["priority_order"].append(user.id)
+    old_cat_key, old_name, old_item = find_global_item(current_item_name)
+    if not old_name:
+        await interaction.followup.send("❌ Item not found.", ephemeral=True)
+        return
+
+    if normalize_item_name(new_item_name) != normalize_item_name(old_name):
+        if item_exists_globally(new_item_name):
+            await interaction.followup.send(
+                "❌ The new item name already exists globally.",
+                ephemeral=True
+            )
+            return
+
+    # rebuild global item
+    del data_store["global_items"][old_cat_key]["items"][old_name]
+    data_store["global_items"][category.value]["items"][new_item_name] = {
+        "capacity": cap,
+        "selections": []
+    }
+
+    # update all events, preserving selections when possible
+    for event in data_store["events"].values():
+        old_event_item = None
+        if old_name in event["categories"][old_cat_key]["items"]:
+            old_event_item = event["categories"][old_cat_key]["items"][old_name]
+
+        if old_event_item:
+            selections = old_event_item.get("selections", [])
+            del event["categories"][old_cat_key]["items"][old_name]
+        else:
+            selections = []
+
+        event["categories"][category.value]["items"][new_item_name] = {
+            "capacity": cap,
+            "selections": selections
+        }
 
     await save_data()
-    await refresh_panel_by_event(event)
-    await interaction.followup.send("✅ Priority added.", ephemeral=True)
+    await refresh_all_event_panels()
+
+    await interaction.followup.send(
+        f"✅ Updated **{current_item_name}** → **{new_item_name}**.\n"
+        f"Category: **{category.name}** | Cap: **{cap}**",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="remove_item", description="Remove a global item from all events")
+async def remove_item(
+    interaction: discord.Interaction,
+    item_name: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    cat_key, existing_name, _ = find_global_item(item_name)
+    if not existing_name:
+        await interaction.followup.send("❌ Item not found.", ephemeral=True)
+        return
+
+    del data_store["global_items"][cat_key]["items"][existing_name]
+
+    for event in data_store["events"].values():
+        if existing_name in event["categories"][cat_key]["items"]:
+            del event["categories"][cat_key]["items"][existing_name]
+
+    await save_data()
+    await refresh_all_event_panels()
+
+    await interaction.followup.send(
+        f"✅ Removed **{existing_name}** from all events.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="add_priority", description="Add a priority player to a dated event")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def add_priority(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str,
+    user: discord.Member
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = ensure_event(event.value, run_date)
+    if user.id not in ev["priority_order"]:
+        ev["priority_order"].append(user.id)
+
+    await save_data()
+    await refresh_panel_by_event(ev)
+    await interaction.followup.send(
+        f"✅ Added {user.mention} to priority for **{ev['name']}**.",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="lock_event", description="Lock event, auto-assign leftovers, and announce winners")
-async def lock_event(interaction: discord.Interaction, name: str):
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def lock_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
     await interaction.response.defer(ephemeral=True)
 
-    event = ensure_event(name)
-    auto_assign_leftovers(event)
-    event["is_locked"] = True
+    ev = ensure_event(event.value, run_date)
+    auto_assign_leftovers(ev)
+    ev["is_locked"] = True
 
-    winners = ["🏆 **Winners**", ""]
-    for cat in event["categories"].values():
+    winners = [f"🏆 **Winners — {ev['name']}**", ""]
+    for cat in ev["categories"].values():
         for item_name, item_data in cat["items"].items():
             if item_data["selections"]:
                 users = ", ".join([f"<@{x['user_id']}>" for x in item_data["selections"]])
                 winners.append(f"**{item_name}**: {users}")
 
     await save_data()
-    await refresh_panel_by_event(event)
+    await refresh_panel_by_event(ev)
 
     await interaction.channel.send("\n".join(winners))
-    await interaction.followup.send(f"✅ Event **{name}** locked.", ephemeral=True)
+    await interaction.followup.send(f"✅ Event **{ev['name']}** locked.", ephemeral=True)
 
 
-@bot.tree.command(name="unlock_event", description="Unlock an event")
-async def unlock_event(interaction: discord.Interaction, name: str):
+@bot.tree.command(name="unlock_event", description="Unlock a dated event")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def unlock_event(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str
+):
     await interaction.response.defer(ephemeral=True)
 
-    event = get_event(name)
-    if not event:
+    ev = get_event(event.value, run_date)
+    if not ev:
         await interaction.followup.send("❌ Event not found.", ephemeral=True)
         return
 
-    event["is_locked"] = False
+    ev["is_locked"] = False
     await save_data()
-    await refresh_panel_by_event(event)
-    await interaction.followup.send(f"✅ Event **{name}** unlocked.", ephemeral=True)
+    await refresh_panel_by_event(ev)
+
+    await interaction.followup.send(f"✅ Event **{ev['name']}** unlocked.", ephemeral=True)
 
 
-@bot.tree.command(name="show_events", description="Show all events")
+@bot.tree.command(name="show_events", description="Show all created dated events")
 async def show_events(interaction: discord.Interaction):
     events = data_store.get("events", {})
     if not events:
@@ -545,7 +761,25 @@ async def show_events(interaction: discord.Interaction):
         return
 
     names = [f"• {ev['name']}" for ev in events.values()]
-    await interaction.response.send_message("\n".join(names), ephemeral=True)
+    await interaction.response.send_message("\n".join(names[:100]), ephemeral=True)
+
+
+@bot.tree.command(name="show_items", description="Show all global items")
+async def show_items(interaction: discord.Interaction):
+    main_items = list(data_store["global_items"]["main"]["items"].keys())
+    other_items = list(data_store["global_items"]["other"]["items"].keys())
+
+    main_text = "\n".join(f"• {x}" for x in main_items[:50]) if main_items else "None"
+    other_text = "\n".join(f"• {x}" for x in other_items[:50]) if other_items else "None"
+
+    embed = discord.Embed(
+        title="Global Item List",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Main Items", value=main_text[:1024], inline=False)
+    embed.add_field(name="Other Items", value=other_text[:1024], inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # =========================
