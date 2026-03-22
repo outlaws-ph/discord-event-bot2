@@ -216,7 +216,8 @@ def build_category_text(event: dict, category_key: str) -> str:
     items = event["categories"][category_key]["items"]
     blocks = []
 
-    for item_name, item_data in items.items():
+    for item_name in sorted(items.keys(), key=str.lower):
+        item_data = items[item_name]
         count = len(item_data["selections"])
         cap = item_data["capacity"]
         users = [f"<@{x['user_id']}>" for x in item_data["selections"]]
@@ -323,7 +324,7 @@ class ItemSelect(discord.ui.Select):
                 value=item_name,
                 description=f"{len(item_data['selections'])}/{item_data['capacity']} reserved"
             )
-            for item_name, item_data in items.items()
+            for item_name, item_data in sorted(items.items(), key=lambda x: x[0].lower())
         ]
 
         placeholder = "Choose a main item" if category_key == "main" else "Choose an other item"
@@ -384,7 +385,7 @@ class RemoveSelect(discord.ui.Select):
 
         options = []
         for cat in ["main", "other"]:
-            for item_name, item_data in event["categories"][cat]["items"].items():
+            for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
                 options.append(
                     discord.SelectOption(
                         label=item_name[:100],
@@ -439,7 +440,7 @@ class EditCapItemSelect(discord.ui.Select):
 
         options = []
         for cat in ["main", "other"]:
-            for item_name, item_data in event["categories"][cat]["items"].items():
+            for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
                 options.append(
                     discord.SelectOption(
                         label=item_name[:100],
@@ -502,11 +503,7 @@ class EditCapModal(discord.ui.Modal, title="Set New Cap"):
 
 class EditCapButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(
-            label="✏️ Edit Cap",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"editcap:{ev_key}"
-        )
+        super().__init__(label="✏️ Edit Cap", style=discord.ButtonStyle.primary, custom_id=f"editcap:{ev_key}")
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -526,7 +523,7 @@ class AddItemSingleSelect(discord.ui.Select):
 
         options = []
         for cat in ["main", "other"]:
-            for item_name in data_store["global_items"][cat]["items"].keys():
+            for item_name in sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower):
                 options.append(discord.SelectOption(label=item_name[:100], value=item_name))
 
         super().__init__(
@@ -574,7 +571,7 @@ class AddItemBulkSelect(discord.ui.Select):
 
         options = []
         for cat in ["main", "other"]:
-            for item_name in data_store["global_items"][cat]["items"].keys():
+            for item_name in sorted(data_store["global_items"][cat]["items"].keys(), key=str.lower):
                 options.append(discord.SelectOption(label=item_name[:100], value=item_name))
 
         super().__init__(
@@ -680,11 +677,7 @@ class AddItemBulkCapModal(discord.ui.Modal, title="Bulk Add Items"):
 
 class AddItemButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(
-            label="➕ Add Item",
-            style=discord.ButtonStyle.success,
-            custom_id=f"additem:{ev_key}"
-        )
+        super().__init__(label="➕ Add Item", style=discord.ButtonStyle.success, custom_id=f"additem:{ev_key}")
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -714,7 +707,7 @@ class RemoveItemFromPanelSelect(discord.ui.Select):
 
         options = []
         for cat in ["main", "other"]:
-            for item_name, item_data in event["categories"][cat]["items"].items():
+            for item_name, item_data in sorted(event["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
                 options.append(
                     discord.SelectOption(
                         label=item_name[:100],
@@ -756,11 +749,7 @@ class RemoveItemFromPanelSelect(discord.ui.Select):
 
 class RemoveItemButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(
-            label="🗑️ Remove Item",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"removeitem:{ev_key}"
-        )
+        super().__init__(label="🗑️ Remove Item", style=discord.ButtonStyle.danger, custom_id=f"removeitem:{ev_key}")
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -776,11 +765,7 @@ class RemoveItemButton(discord.ui.Button):
 class AddPriorityUserSelect(discord.ui.UserSelect):
     def __init__(self, ev_key: str):
         self.ev_key = ev_key
-        super().__init__(
-            placeholder="Select user to add to priority",
-            min_values=1,
-            max_values=1
-        )
+        super().__init__(placeholder="Select user to add to priority", min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         event = data_store["events"][self.ev_key]
@@ -793,19 +778,12 @@ class AddPriorityUserSelect(discord.ui.UserSelect):
         event["priority_order"].append(user.id)
         await save_data()
         await refresh_panel_by_event(event)
-        await interaction.response.send_message(
-            f"✅ Added {user.mention} to priority.",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"✅ Added {user.mention} to priority.", ephemeral=True)
 
 
 class AddPriorityButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(
-            label="👑 Add Priority",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"addpriority:{ev_key}"
-        )
+        super().__init__(label="👑 Add Priority", style=discord.ButtonStyle.primary, custom_id=f"addpriority:{ev_key}")
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -852,19 +830,12 @@ class RemovePrioritySelect(discord.ui.Select):
         event["priority_order"].remove(user_id)
         await save_data()
         await refresh_panel_by_event(event)
-        await interaction.response.send_message(
-            f"✅ Removed <@{user_id}> from priority.",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"✅ Removed <@{user_id}> from priority.", ephemeral=True)
 
 
 class RemovePriorityButton(discord.ui.Button):
     def __init__(self, ev_key: str):
-        super().__init__(
-            label="➖ Remove Priority",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"removepriority:{ev_key}"
-        )
+        super().__init__(label="➖ Remove Priority", style=discord.ButtonStyle.danger, custom_id=f"removepriority:{ev_key}")
         self.ev_key = ev_key
 
     async def callback(self, interaction: discord.Interaction):
@@ -905,10 +876,7 @@ async def create_event(
     ev = ensure_event(event.value, run_date)
     await save_data()
 
-    await interaction.followup.send(
-        f"✅ Event **{ev['name']}** created.",
-        ephemeral=True
-    )
+    await interaction.followup.send(f"✅ Event **{ev['name']}** created.", ephemeral=True)
 
 
 @bot.tree.command(name="create_panel", description="Create a panel from preset event list")
@@ -930,10 +898,7 @@ async def create_panel(
     ev["panel_message_id"] = msg.id
 
     await save_data()
-    await interaction.followup.send(
-        f"✅ Panel created for **{ev['name']}**.",
-        ephemeral=True
-    )
+    await interaction.followup.send(f"✅ Panel created for **{ev['name']}**.", ephemeral=True)
 
 
 @bot.tree.command(name="remove_event", description="Remove a dated event")
@@ -955,10 +920,7 @@ async def remove_event(
     del data_store["events"][ev_key]
     await save_data()
 
-    await interaction.followup.send(
-        f"✅ Removed **{event.value} {run_date}**.",
-        ephemeral=True
-    )
+    await interaction.followup.send(f"✅ Removed **{event.value} {run_date}**.", ephemeral=True)
 
 
 @bot.tree.command(name="add_item", description="Add an item to the global item library")
@@ -986,10 +948,82 @@ async def add_item(
     )
 
 
+@bot.tree.command(name="remove_global_item", description="Remove item from global library")
+async def remove_global_item(
+    interaction: discord.Interaction,
+    item_name: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    for cat in ["main", "other"]:
+        for existing_name in list(data_store["global_items"][cat]["items"].keys()):
+            if normalize_item_name(existing_name) == normalize_item_name(item_name):
+                del data_store["global_items"][cat]["items"][existing_name]
+                await save_data()
+                await interaction.followup.send(
+                    f"✅ Removed **{existing_name}** from global library.",
+                    ephemeral=True
+                )
+                return
+
+    await interaction.followup.send("❌ Item not found in global library.", ephemeral=True)
+
+
+@bot.tree.command(name="add_global_items_bulk", description="Add multiple items to the global library")
+@app_commands.choices(category=CATEGORY_CHOICES)
+async def add_global_items_bulk(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str],
+    cap: app_commands.Range[int, 1, 99],
+    item_names: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    raw_items = [x.strip() for x in item_names.split(",")]
+    cleaned_items = []
+    seen = set()
+
+    for item in raw_items:
+        if not item:
+            continue
+        norm = normalize_item_name(item)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        cleaned_items.append(item)
+
+    if not cleaned_items:
+        await interaction.followup.send("❌ No valid item names found.", ephemeral=True)
+        return
+
+    added = []
+    skipped = []
+
+    for item in cleaned_items:
+        if item_exists_globally(item):
+            skipped.append(item)
+            continue
+
+        data_store["global_items"][category.value]["items"][item] = {
+            "capacity": cap
+        }
+        added.append(item)
+
+    await save_data()
+
+    parts = []
+    if added:
+        parts.append(f"✅ Added to global **{category.name}** with cap **{cap}**:\n" + ", ".join(added))
+    if skipped:
+        parts.append("⚠️ Skipped duplicates:\n" + ", ".join(skipped))
+
+    await interaction.followup.send("\n\n".join(parts), ephemeral=True)
+
+
 @bot.tree.command(name="show_items", description="Show all global library items")
 async def show_items(interaction: discord.Interaction):
-    main_items = list(data_store["global_items"]["main"]["items"].keys())
-    other_items = list(data_store["global_items"]["other"]["items"].keys())
+    main_items = sorted(data_store["global_items"]["main"]["items"].keys(), key=str.lower)
+    other_items = sorted(data_store["global_items"]["other"]["items"].keys(), key=str.lower)
 
     main_text = "\n".join(f"• {x}" for x in main_items[:50]) if main_items else "None"
     other_text = "\n".join(f"• {x}" for x in other_items[:50]) if other_items else "None"
@@ -1019,7 +1053,7 @@ async def lock_event(
 
     winners = [f"🏆 **Winners — {ev['name']}**", ""]
     for cat in ["main", "other"]:
-        for item_name, item_data in ev["categories"][cat]["items"].items():
+        for item_name, item_data in sorted(ev["categories"][cat]["items"].items(), key=lambda x: x[0].lower()):
             if item_data["selections"]:
                 users = ", ".join([f"<@{x['user_id']}>" for x in item_data["selections"]])
                 winners.append(f"**{item_name}**: {users}")
@@ -1058,7 +1092,7 @@ async def show_events(interaction: discord.Interaction):
         await interaction.response.send_message("No events yet.", ephemeral=True)
         return
 
-    names = [f"• {ev['name']}" for ev in data_store["events"].values()]
+    names = [f"• {ev['name']}" for ev in sorted(data_store["events"].values(), key=lambda x: x["name"].lower())]
     await interaction.response.send_message("\n".join(names[:100]), ephemeral=True)
 
 
