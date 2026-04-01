@@ -1,32 +1,114 @@
 {
-  "priority_order": [],
-  "panel_channel_id": null,
-  "panel_message_id": null,
-  "categories": {
-    "main_items": {
-      "label": "Main Items",
-      "items": {
-        "Rune Bracelet": {"capacity": 1, "selections": []},
-        "Rune Gloves": {"capacity": 1, "selections": []},
-        "Steel Spear": {"capacity": 1, "selections": []},
-        "Steel Helmet": {"capacity": 1, "selections": []},
-        "Grim Helmet": {"capacity": 1, "selections": []},
-        "Grim Lyra": {"capacity": 1, "selections": []},
-        "Grim Spear": {"capacity": 1, "selections": []},
-        "Grim Gloves": {"capacity": 1, "selections": []},
-        "Grim Necklace": {"capacity": 1, "selections": []},
-        "Storm Chain": {"capacity": 1, "selections": []}
-      }
-    },
-    "other_items": {
-      "label": "Other Items",
-      "items": {
-        "Old Silver Coin": {"capacity": 1, "selections": []},
-        "Gold Key": {"capacity": 1, "selections": []},
-        "Soul (UC)": {"capacity": 1, "selections": []},
-        "Soul (Rare)": {"capacity": 1, "selections": []},
-        "Soul (Epic)": {"capacity": 1, "selections": []}
-      }
-    }
-  }
+  "global_items": {
+    "Kari Axe": { "capacity": 1 },
+    "Rune Axe": { "capacity": 1 },
+    "Storm Axe": { "capacity": 1 },
+    "Grim Axe": { "capacity": 1 },
+    "Steel Axe": { "capacity": 1 },
+    
+    "Kari Lyra": { "capacity": 1 },
+    "Rune Lyra": { "capacity": 1 },
+    "Storm Lyra": { "capacity": 1 },
+    "Grim Lyra": { "capacity": 1 },
+    "Steel Lyra": { "capacity": 1 },
+
+    "Kari Totem": { "capacity": 1 },
+    "Rune Totem": { "capacity": 1 },
+    "Storm Totem": { "capacity": 1 },
+    "Grim Totem": { "capacity": 1 },
+    "Steel Totem": { "capacity": 1 },
+
+    "Kari Spear": { "capacity": 1 },
+    "Rune Spear": { "capacity": 1 },
+    "Storm Spear": { "capacity": 1 },
+    "Grim Spear": { "capacity": 1 },
+    "Steel Spear": { "capacity": 1 },
+
+    "Kari Shortbow": { "capacity": 1 },
+    "Rune Shortbow": { "capacity": 1 },
+    "Storm Shortbow": { "capacity": 1 },
+    "Grim Shortbow": { "capacity": 1 },
+    "Steel Shortbow": { "capacity": 1 },
+
+    "Kari Chain": { "capacity": 1 },
+    "Rune Chain": { "capacity": 1 },
+    "Storm Chain": { "capacity": 1 },
+    "Grim Chain": { "capacity": 1 },
+    "Steel Chain": { "capacity": 1 },
+
+    "Kari Score": { "capacity": 1 },
+    "Rune Score": { "capacity": 1 },
+    "Storm Score": { "capacity": 1 },
+    "Grim Score": { "capacity": 1 },
+    "Steel Score": { "capacity": 1 },
+    
+    "Kari Quartz": { "capacity": 1 },
+    "Rune Quartz": { "capacity": 1 },
+    "Storm Quartz": { "capacity": 1 },
+    "Grim Quartz": { "capacity": 1 },
+    "Steel Quartz": { "capacity": 1 },
+
+    "Kari Dagger": { "capacity": 1 },
+    "Rune Dagger": { "capacity": 1 },
+    "Storm Dagger": { "capacity": 1 },
+    "Grim Dagger": { "capacity": 1 },
+    "Steel Dagger": { "capacity": 1 },
+
+    "Kari Trap Box": { "capacity": 1 },
+    "Rune Trap Box": { "capacity": 1 },
+    "Storm Trap Box": { "capacity": 1 },
+    "Grim Trap Box": { "capacity": 1 },
+    "Steel Trap Box": { "capacity": 1 },
+
+    "Kari Top": { "capacity": 1 },
+    "Rune Top": { "capacity": 1 },
+    "Storm Top": { "capacity": 1 },
+    "Grim Top": { "capacity": 1 },
+    "Steel Top": { "capacity": 1 },
+
+    "Kari Bottoms": { "capacity": 1 },
+    "Rune Bottoms": { "capacity": 1 },
+    "Storm Bottoms": { "capacity": 1 },
+    "Grim Bottoms": { "capacity": 1 },
+    "Steel Bottoms": { "capacity": 1 },
+
+    "Kari Gloves": { "capacity": 1 },
+    "Rune Gloves": { "capacity": 1 },
+    "Storm Gloves": { "capacity": 1 },
+    "Grim Gloves": { "capacity": 1 },
+    "Steel Gloves": { "capacity": 1 },
+
+    "Kari Shoes": { "capacity": 1 },
+    "Rune Shoes": { "capacity": 1 },
+    "Storm Shoes": { "capacity": 1 },
+    "Grim Shoes": { "capacity": 1 },
+    "Steel Shoes": { "capacity": 1 },
+
+    "Kari Helmet": { "capacity": 1 },
+    "Rune Helmet": { "capacity": 1 },
+    "Storm Helmet": { "capacity": 1 },
+    "Grim Helmet": { "capacity": 1 },
+    "Steel Helmet": { "capacity": 1 },
+
+    "Kari Necklace": { "capacity": 1 },
+    "Rune Necklace": { "capacity": 1 },
+    "Storm Necklace": { "capacity": 1 },
+    "Grim Necklace": { "capacity": 1 },
+    "Steel Necklace": { "capacity": 1 },    
+
+    "Kari Bracelet": { "capacity": 1 },
+    "Rune Bracelet": { "capacity": 1 },
+    "Storm Bracelet": { "capacity": 1 },
+    "Grim Bracelet": { "capacity": 1 },
+    "Steel Bracelet": { "capacity": 1 },    
+
+    "Kari Ring": { "capacity": 1 },
+    "Rune Ring": { "capacity": 1 },
+    "Storm Ring": { "capacity": 1 },
+    "Grim Ring": { "capacity": 1 },
+    "Steel Ring": { "capacity": 1 },    
+    
+    "Jormun Mining PickAxe": { "capacity": 1 }
+  },
+  "events": {}
 }
