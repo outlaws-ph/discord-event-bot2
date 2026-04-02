@@ -1688,8 +1688,9 @@ async def on_ready():
     for ev_key in data_store["events"].keys():
         bot.add_view(PanelView(ev_key))
 
-    await bot.tree.sync()
-    print("READY")
+    synced = await bot.tree.sync()
+    print(f"READY - synced {len(synced)} commands")
+    print("COMMANDS:", [cmd.name for cmd in synced])
 
 
 bot.run(TOKEN)
