@@ -45,11 +45,10 @@ def ensure_data_defaults(data: dict) -> dict:
     if not isinstance(data, dict):
         data = {}
 
-    # Global library (flat)
     if "global_items" not in data or not isinstance(data["global_items"], dict):
         data["global_items"] = {}
 
-    # Migrate old category-based global items -> flat global_items
+    # migrate old top-level category format -> flat global_items
     old_categories = data.get("categories")
     if isinstance(old_categories, dict):
         for cat_data in old_categories.values():
@@ -68,10 +67,10 @@ def ensure_data_defaults(data: dict) -> dict:
         data["events"] = {}
 
     for ev in data["events"].values():
-        # Migrate old category-based event data -> flat event["items"]
         if "items" not in ev or not isinstance(ev["items"], dict):
             ev["items"] = {}
 
+        # migrate old event category format -> flat items
         old_ev_categories = ev.get("categories")
         if isinstance(old_ev_categories, dict):
             for cat_data in old_ev_categories.values():
@@ -105,7 +104,6 @@ def ensure_data_defaults(data: dict) -> dict:
         if not isinstance(ev["ui_state"].get("page"), int) or ev["ui_state"]["page"] < 0:
             ev["ui_state"]["page"] = 0
 
-        # cleanup old field if present
         if "categories" in ev:
             del ev["categories"]
 
@@ -324,13 +322,13 @@ def build_priority_preview(event: dict) -> str:
         return "No priority players set."
 
     lines = []
-    for i, user_id in enumerate(event["priority_order"][:10], start=1):
+    for i, user_id in enumerate(event["priority_order"], start=1):
         lines.append(f"{i}. <@{user_id}>")
 
-    if len(event["priority_order"]) > 10:
-        lines.append(f"+{len(event['priority_order']) - 10} more")
-
-    return "\n".join(lines)[:1024]
+    text = "\n".join(lines)
+    if len(text) > 1024:
+        text = text[:1020] + "..."
+    return text
 
 
 def build_current_page_details(event: dict) -> str:
@@ -348,18 +346,16 @@ def build_current_page_details(event: dict) -> str:
         cap = item_data["capacity"]
         users = [f"<@{x['user_id']}>" for x in item_data["selections"]]
 
-        if users:
-            display_users = ", ".join(users[:8])
-            if len(users) > 8:
-                display_users += f" +{len(users) - 8} more"
-        else:
-            display_users = "—"
+        display_users = ", ".join(users) if users else "—"
 
         blocks.append(f"**{item_name}** `{count}/{cap}`")
         blocks.append(display_users)
         blocks.append("")
 
-    return "\n".join(blocks).strip()[:4096]
+    text = "\n".join(blocks).strip()
+    if len(text) > 4096:
+        text = text[:4092] + "..."
+    return text
 
 
 def build_embed(event: dict) -> discord.Embed:
@@ -1146,6 +1142,125 @@ class RemoveItemButton(discord.ui.Button):
         await interaction.response.send_message("Select item to remove:", view=view, ephemeral=True)
 
 
+class RemovePlayerItemSelect(discord.ui.Select):
+    def __init__(self, ev_key: str):
+        self.ev_key = ev_key
+        event = data_store["events"][ev_key]
+
+        options = []
+        for item_name, item_data in get_sorted_event_items(event):
+            if item_data["selections"]:
+                options.append(
+                    discord.SelectOption(
+                        label=item_name[:100],
+                        value=item_name,
+                        description=f"{len(item_data['selections'])}/{item_data['capacity']} selected"
+                    )
+                )
+
+        super().__init__(
+            placeholder="Select item",
+            options=options[:25] if options else [
+                discord.SelectOption(label="No items with players", value="__none__")
+            ],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("No items with selected players.", ephemeral=True)
+            return
+
+        item_name = self.values[0]
+        view = discord.ui.View()
+        view.add_item(RemovePlayerUserSelect(self.ev_key, item_name))
+        await interaction.response.send_message(
+            f"Select player to remove from **{item_name}**:",
+            view=view,
+            ephemeral=True
+        )
+
+
+class RemovePlayerUserSelect(discord.ui.Select):
+    def __init__(self, ev_key: str, item_name: str):
+        self.ev_key = ev_key
+        self.item_name = item_name
+
+        event = data_store["events"][ev_key]
+        item = event["items"][item_name]
+
+        options = []
+        for entry in item["selections"]:
+            user_id = entry["user_id"]
+            options.append(
+                discord.SelectOption(
+                    label=str(user_id),
+                    value=str(user_id),
+                    description=f"Remove user {user_id} from this item"[:100]
+                )
+            )
+
+        super().__init__(
+            placeholder="Select player to remove",
+            options=options[:25] if options else [
+                discord.SelectOption(label="No players found", value="__none__")
+            ],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("No players found.", ephemeral=True)
+            return
+
+        event = data_store["events"][self.ev_key]
+        item = event["items"][self.item_name]
+        target_user_id = int(self.values[0])
+
+        before = len(item["selections"])
+        item["selections"] = [
+            x for x in item["selections"]
+            if x["user_id"] != target_user_id
+        ]
+
+        if len(item["selections"]) == before:
+            await interaction.response.send_message("Player was not found in that item.", ephemeral=True)
+            return
+
+        await save_data()
+        await refresh_panel_by_event(event)
+        await interaction.response.send_message(
+            f"✅ Removed <@{target_user_id}> from **{self.item_name}**.",
+            ephemeral=True
+        )
+
+
+class RemovePlayerButton(discord.ui.Button):
+    def __init__(self, ev_key: str):
+        super().__init__(
+            label="Remove Player",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"removeplayer:{ev_key}",
+            row=4
+        )
+        self.ev_key = ev_key
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+
+        view = discord.ui.View()
+        view.add_item(RemovePlayerItemSelect(self.ev_key))
+        await interaction.response.send_message(
+            "Select the item first:",
+            view=view,
+            ephemeral=True
+        )
+
+
 class AddPriorityUserSelect(discord.ui.UserSelect):
     def __init__(self, ev_key: str):
         self.ev_key = ev_key
@@ -1250,7 +1365,7 @@ class PanelView(discord.ui.View):
         self.add_item(ItemSelect(ev_key))
         self.add_item(RemoveMyItemButton(ev_key))
 
-        # Page controls still kept so users can move through many items
+        # Page controls
         self.add_item(PrevPageButton(ev_key))
         self.add_item(PageInfoButton(ev_key))
         self.add_item(NextPageButton(ev_key))
@@ -1261,6 +1376,7 @@ class PanelView(discord.ui.View):
         self.add_item(EditCapButton(ev_key))
         self.add_item(AddPriorityButton(ev_key))
         self.add_item(RemovePriorityButton(ev_key))
+        self.add_item(RemovePlayerButton(ev_key))
 
 
 # =========================
@@ -1486,6 +1602,79 @@ async def show_events(interaction: discord.Interaction):
 
     names = [f"• {ev['name']}" for ev in sorted(data_store["events"].values(), key=lambda x: x["name"].lower())]
     await interaction.response.send_message("\n".join(names[:100]), ephemeral=True)
+
+
+@bot.tree.command(name="show_item_picks", description="Show all players who picked a specific item")
+@app_commands.choices(event=PRESET_EVENT_CHOICES)
+async def show_item_picks(
+    interaction: discord.Interaction,
+    event: app_commands.Choice[str],
+    run_date: str,
+    item_name: str
+):
+    await interaction.response.defer(ephemeral=True)
+
+    ev = get_event(event.value, run_date)
+    if not ev:
+        await interaction.followup.send("❌ Event not found.", ephemeral=True)
+        return
+
+    actual_name = None
+    for existing_name in ev["items"].keys():
+        if normalize_item_name(existing_name) == normalize_item_name(item_name):
+            actual_name = existing_name
+            break
+
+    if not actual_name:
+        await interaction.followup.send("❌ Item not found in this event.", ephemeral=True)
+        return
+
+    item = ev["items"][actual_name]
+    selections = item["selections"]
+
+    if not selections:
+        await interaction.followup.send(
+            f"**{actual_name}** has no players yet.",
+            ephemeral=True
+        )
+        return
+
+    lines = []
+    for i, entry in enumerate(selections, start=1):
+        uid = entry["user_id"]
+        rank = get_rank(ev, uid)
+        priority_text = f" (Priority #{rank})" if rank != 999999 else ""
+        lines.append(f"{i}. <@{uid}>{priority_text}")
+
+    text = "\n".join(lines)
+
+    if len(text) > 1900:
+        chunks = []
+        current = ""
+
+        for line in lines:
+            if len(current) + len(line) + 1 > 1900:
+                chunks.append(current)
+                current = line
+            else:
+                current = f"{current}\n{line}".strip()
+
+        if current:
+            chunks.append(current)
+
+        await interaction.followup.send(
+            f"**{actual_name}** — players who picked this item:",
+            ephemeral=True
+        )
+
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"**{actual_name}** — players who picked this item:\n\n{text}",
+        ephemeral=True
+    )
 
 
 # =========================
